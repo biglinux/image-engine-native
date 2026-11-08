@@ -563,6 +563,8 @@ impl Network {
         height: usize,
         step: &mut dyn FnMut() -> ControlFlow<()>,
     ) -> Result<Vec<f32>, Error> {
+        // A failed wait may have left work running on the GPU.
+        self.gpu.usable().map_err(Error::Gpu)?;
         let (mut h, mut w) = padded(width, height);
         let pixels = h * w;
         if self.maps.as_ref().is_none_or(|m| m.pixels < pixels) {

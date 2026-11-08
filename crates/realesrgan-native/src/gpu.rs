@@ -126,6 +126,8 @@ impl Network {
         height: usize,
         step: &mut dyn FnMut() -> ControlFlow<()>,
     ) -> Result<&[[u8; 2]], Error> {
+        // A failed wait may have left work running on the GPU.
+        self.gpu.usable().map_err(Error::Gpu)?;
         let pixels = width * height;
         if self.maps.as_ref().is_none_or(|m| m.pixels < pixels) {
             // Free the smaller maps before making the larger ones.

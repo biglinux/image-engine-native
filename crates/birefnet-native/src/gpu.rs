@@ -470,6 +470,8 @@ impl Network {
     /// As `Model::run_normalized`, on the GPU, for the image `fill` writes
     /// as little-endian half floats.
     pub fn run(&mut self, side: usize, fill: &dyn Fn(&mut [[u8; 2]])) -> Result<Vec<f32>, Error> {
+        // A failed wait may have left work running on the GPU.
+        self.gpu.usable().map_err(Error::Gpu)?;
         if self.maps.as_ref().is_none_or(|m| m.side != side) {
             // Free the smaller maps before making the larger ones.
             self.maps = None;

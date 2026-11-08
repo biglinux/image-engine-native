@@ -47,9 +47,11 @@ struct Device {
     handle: Handle,
     d: ffi::device::Functions,
     memory: ffi::MemoryProperties,
-    /// Set when an object made from the device was leaked because the device
-    /// could still be using it; the device and instance are then leaked too.
-    leaked: AtomicBool,
+    /// Set once the device may still be running work that a failed wait left
+    /// behind. From then on nothing is submitted, no host buffer is read or
+    /// written, an object is destroyed only once the device is idle, and the
+    /// device and its instance are leaked.
+    busy: AtomicBool,
     /// Destroyed after the device.
     instance: ManuallyDrop<Instance>,
 }
@@ -63,7 +65,7 @@ unsafe impl Sync for Device {}
 
 impl Drop for Device {
     fn drop(&mut self) {
-        if !self.idle() || self.leaked.load(Ordering::Relaxed) {
+        if !self.idle() || self.busy.load(Ordering::Acquire) {
             return;
         }
         // SAFETY: every object made from the device is gone, since each holds
@@ -92,7 +94,7 @@ impl Device {
     fn release(&self) -> bool {
         let idle = self.idle();
         if !idle {
-            self.leaked.store(true, Ordering::Relaxed);
+            self.busy.store(true, Ordering::Release);
         }
         idle
     }
@@ -126,9 +128,6 @@ pub struct Gpu {
     groups: [u32; 3],
     /// Bytes a storage buffer may span in a shader.
     storage_range: u32,
-    /// Set when a submission may still run after its waits failed; nothing
-    /// is submitted again, so that its objects are never reused.
-    stuck: bool,
 }
 
 // SAFETY: `Gpu` is not `Sync`, so every reference to it, and to the queue,
@@ -175,7 +174,7 @@ impl Gpu {
             handle,
             d,
             memory,
-            leaked: AtomicBool::new(false),
+            busy: AtomicBool::new(false),
             instance: ManuallyDrop::new(instance),
         });
         let limits = &choice.props.limits;
@@ -191,7 +190,6 @@ impl Gpu {
             shared_memory: limits.max_compute_shared_memory_size,
             groups: limits.max_compute_work_group_count,
             storage_range: limits.max_storage_buffer_range,
-            stuck: false,
         };
         let (d, h) = (&gpu.dev.d, gpu.dev.handle);
         // SAFETY: the device is valid and each create-info lives across its
@@ -302,6 +300,7 @@ impl Gpu {
     /// A storage buffer in the GPU's own memory holding `words`, copied in
     /// through a host buffer.
     pub fn upload(&mut self, words: &Words) -> Result<Buffer, String> {
+        self.usable()?;
         let size = 2 * words.len;
         let buffer = self.buffer(size)?;
         let mut staging = self.host_buffer(size, false)?;
@@ -431,7 +430,7 @@ impl Gpu {
 
     /// Wait for slot `slot`'s submission, then make its fence and descriptor
     /// sets reusable.
-    fn wait(&mut self, slot: usize) -> Result<(), String> {
+    fn wait(&self, slot: usize) -> Result<(), String> {
         let (d, h) = (&self.dev.d, self.dev.handle);
         // SAFETY: the fence belongs to the device and went with the slot's
         // submission.
@@ -441,7 +440,7 @@ impl Gpu {
         // A failed fence wait may leave the submission running, and nothing
         // below may reset its objects until the device is idle.
         if waited.is_err() && !self.dev.idle() {
-            self.stuck = true;
+            self.dev.busy.store(true, Ordering::Release);
             return waited;
         }
         // SAFETY: the submission has finished.
@@ -451,9 +450,10 @@ impl Gpu {
         waited.and(reset).and(self.reset(slot))
     }
 
-    /// Refuse to record while a submission may still run (see `stuck`).
-    fn usable(&self) -> Result<(), String> {
-        if self.stuck {
+    /// An error once a failed wait has left work running on the GPU: it then
+    /// takes no more submissions, and its host buffers are not to be touched.
+    pub fn usable(&self) -> Result<(), String> {
+        if self.dev.busy.load(Ordering::Acquire) {
             Err("an earlier submission may still be running".into())
         } else {
             Ok(())
@@ -825,11 +825,17 @@ impl Buffer {
     /// The buffer's bytes, which only a host buffer has. A buffer a
     /// [`Steps`] submission uses must not be read or written until a later
     /// [`Steps::submit`] or [`Steps::finish`] has waited for that submission.
+    /// Panics while [`Gpu::usable`] is an error.
     pub fn bytes(&self) -> &[u8] {
         assert!(!self.map.is_null(), "a device buffer has no CPU mapping");
+        assert!(
+            !self.dev.busy.load(Ordering::Acquire),
+            "the GPU may still use the buffer"
+        );
         // SAFETY: the mapping covers `size` bytes and lives as long as the
         // buffer; no submission uses it while the slice lives, since
-        // `Gpu::run` waits for its own and callers of `Steps` wait as above.
+        // `Gpu::run` waits for its own or marks the device busy, and callers
+        // of `Steps` wait as above.
         unsafe { std::slice::from_raw_parts(self.map, self.size) }
     }
 
@@ -837,6 +843,10 @@ impl Buffer {
     /// them, and as for [`Buffer::bytes`], not while a submission uses it.
     pub fn bytes_mut(&mut self) -> &mut [u8] {
         assert!(!self.map.is_null(), "a device buffer has no CPU mapping");
+        assert!(
+            !self.dev.busy.load(Ordering::Acquire),
+            "the GPU may still use the buffer"
+        );
         // SAFETY: as for `bytes`, and `&mut self` makes the slice unique.
         unsafe { std::slice::from_raw_parts_mut(self.map, self.size) }
     }
