@@ -39,8 +39,8 @@ fn matches_pytorch_reference() {
             continue;
         }
         let reference = path.with_extension("torch.out");
-        let bytes = std::fs::read(&reference)
-            .unwrap_or_else(|e| panic!("{}: {e}", reference.display()));
+        let bytes =
+            std::fs::read(&reference).unwrap_or_else(|e| panic!("{}: {e}", reference.display()));
         let want: Vec<f32> = bytes
             .as_chunks::<4>()
             .0
@@ -85,11 +85,7 @@ fn matches_pytorch_reference() {
         );
         checked += 1;
     }
-    assert!(
-        checked > 0,
-        "no NAME.rgb in {}",
-        dir.display()
-    );
+    assert!(checked > 0, "no NAME.rgb in {}", dir.display());
 }
 
 #[test]
@@ -113,8 +109,11 @@ fn progress_reaches_one_and_cancel_stops() {
     // Pixels outside the mask keep their values.
     assert_eq!(out[..30 * width * 3], image[..30 * width * 3]);
 
+    // Stopped halfway on another image; the model then gives the first
+    // image's result again.
+    let other = vec![200u8; width * height * 3];
     let mut calls = 0;
-    let result = model.run_with_progress(&image, &mask, width, height, |f| {
+    let result = model.run_with_progress(&other, &mask, width, height, |f| {
         calls += 1;
         if f >= 0.5 {
             ControlFlow::Break(())
@@ -124,4 +123,8 @@ fn progress_reaches_one_and_cancel_stops() {
     });
     assert!(matches!(result, Err(Error::Cancelled)));
     assert_eq!(calls, 13);
+    let again = model
+        .run_with_progress(&image, &mask, width, height, |_| ControlFlow::Continue(()))
+        .unwrap();
+    assert_eq!(again, out);
 }

@@ -38,8 +38,8 @@ fn matches_pytorch_reference() {
             continue;
         }
         let reference = path.with_extension("torch.out");
-        let bytes = std::fs::read(&reference)
-            .unwrap_or_else(|e| panic!("{}: {e}", reference.display()));
+        let bytes =
+            std::fs::read(&reference).unwrap_or_else(|e| panic!("{}: {e}", reference.display()));
         let want: Vec<f32> = bytes
             .as_chunks::<4>()
             .0
@@ -79,21 +79,19 @@ fn matches_pytorch_reference() {
         );
         checked += 1;
     }
-    assert!(
-        checked > 0,
-        "no NAME.rgb in {}",
-        dir.display()
-    );
+    assert!(checked > 0, "no NAME.rgb in {}", dir.display());
 }
 
 #[test]
 #[ignore = "needs weights"]
 fn progress_reaches_one_and_cancel_stops() {
     let mut model = Model::load(&PathBuf::from(var("REALESRGAN_NATIVE_WEIGHTS")), 0).unwrap();
-    let image = vec![0.5f32; 128 * 96 * 3];
+    let image: Vec<f32> = (0..128 * 96 * 3)
+        .map(|i| (i % 251) as f32 / 250.0)
+        .collect();
     // Four 64 x 48 tiles of 34 layers each.
     let mut seen = Vec::new();
-    model
+    let whole = model
         .run_float_tiled(&image, 128, 96, 64, 16, |f| {
             seen.push(f);
             ControlFlow::Continue(())
@@ -103,15 +101,28 @@ fn progress_reaches_one_and_cancel_stops() {
     assert!(seen.windows(2).all(|w| w[0] < w[1]));
     assert_eq!(seen.last(), Some(&1.0));
 
+    // Stopped inside the second tile, on another image; the model then
+    // gives the first image's result again.
+    let other = vec![0.5f32; 128 * 96 * 3];
     let mut calls = 0;
-    let result = model.run_float_tiled(&image, 128, 96, 64, 16, |f| {
+    let result = model.run_float_tiled(&other, 128, 96, 64, 16, |f| {
         calls += 1;
-        if f >= 0.5 {
+        if f >= 0.4 {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())
         }
     });
     assert!(matches!(result, Err(Error::Cancelled)));
-    assert_eq!(calls, 2 * 34);
+    assert_eq!(calls, 55);
+    let again = model
+        .run_float_tiled(&image, 128, 96, 64, 16, |_| ControlFlow::Continue(()))
+        .unwrap();
+    assert_eq!(again.len(), whole.len(), "size after a cancel");
+    let differ = again
+        .iter()
+        .zip(&whole)
+        .filter(|(a, w)| a.to_bits() != w.to_bits())
+        .count();
+    assert_eq!(differ, 0, "values that differ after a cancel");
 }
