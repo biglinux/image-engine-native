@@ -125,3 +125,33 @@ fn progress_reaches_one_and_cancel_stops() {
         .count();
     assert_eq!(differ, 0, "values that differ after a cancel");
 }
+
+#[test]
+#[ignore = "needs weights"]
+fn unbounded_margin_runs_whole_image() {
+    let mut model = Model::load(&PathBuf::from(var("SCUNET_NATIVE_WEIGHTS")), 0).unwrap();
+    let image: Vec<f32> = (0..128 * 96 * 3)
+        .map(|i| (i % 251) as f32 / 250.0)
+        .collect();
+    // With tiles of 64, a margin of 128 already gives each tile the whole
+    // image.
+    let covered = model
+        .run_float_tiled(&image, 128, 96, 64, 128, |_| ControlFlow::Continue(()))
+        .unwrap();
+    let unbounded = model
+        .run_float_tiled(&image, 128, 96, 64, usize::MAX, |_| {
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+    assert_eq!(
+        unbounded.len(),
+        covered.len(),
+        "size with an unbounded margin"
+    );
+    let differ = unbounded
+        .iter()
+        .zip(&covered)
+        .filter(|(u, c)| u.to_bits() != c.to_bits())
+        .count();
+    assert_eq!(differ, 0, "values that differ with an unbounded margin");
+}
