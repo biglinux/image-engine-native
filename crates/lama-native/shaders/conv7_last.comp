@@ -30,8 +30,10 @@ const int SWX = 8 * PX + K - 1;
 // A pixel's CK channels as two vectors, rows of SWX pixels.
 shared f16vec4 tile[SW * SWX * 2];
 
+// Clamped too: a workgroup's tile also covers pixels past the map's edge
+// that it computes and drops, and on a small map those reflect out of it.
 int reflect(int i, int n) {
-    return min(abs(i), 2 * (n - 1) - i);
+    return clamp(min(abs(i), 2 * (n - 1) - i), 0, n - 1);
 }
 
 float activate(float v) {
