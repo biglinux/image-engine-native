@@ -47,10 +47,11 @@ struct Device {
     handle: Handle,
     d: ffi::device::Functions,
     memory: ffi::MemoryProperties,
-    /// Set once a failed wait may have left work running. From then on
-    /// nothing is submitted, no host buffer is read or written, and every
-    /// object made from the device is leaked with the device and its
-    /// instance, without waiting again.
+    /// Set once a failed wait, for a submission or for the device while an
+    /// object drops, may have left work running. From then on nothing is
+    /// submitted, no host buffer is read or written, and every object made
+    /// from the device is leaked with the device and its instance, without
+    /// waiting again.
     busy: AtomicBool,
     /// Destroyed after the device.
     instance: ManuallyDrop<Instance>,
@@ -417,6 +418,8 @@ impl Gpu {
 
     /// Queue slot `slot`'s recorded command buffer.
     fn submit(&self, slot: usize) -> Result<(), String> {
+        // Recording may have dropped an object whose release left the GPU busy.
+        self.usable()?;
         let submit = ffi::SubmitInfo {
             s_type: ffi::TYPE_SUBMIT_INFO,
             p_next: null(),
@@ -438,6 +441,11 @@ impl Gpu {
     /// Wait for slot `slot`'s submission, then make its fence and descriptor
     /// sets reusable.
     fn wait(&mut self, slot: usize) -> Result<(), String> {
+        // Waiting again could block for good, and a busy GPU's objects are
+        // leaked rather than reset.
+        if self.dev.busy.load(Ordering::Acquire) {
+            return Err("the GPU may still be running work".into());
+        }
         let (d, h) = (&self.dev.d, self.dev.handle);
         // SAFETY: the fence belongs to the device and went with the slot's
         // submission.
@@ -458,12 +466,12 @@ impl Gpu {
         waited.and(reset).and(self.reset(slot))
     }
 
-    /// An error once a failed wait has left work running on the GPU, whose
-    /// host buffers are then not to be touched, or a fence failed to reset;
-    /// either way the GPU takes no more submissions.
+    /// An error once work may still be running on the GPU (see
+    /// `Device::busy`), whose host buffers are then not to be touched, or a
+    /// fence failed to reset; either way the GPU takes no more submissions.
     pub fn usable(&self) -> Result<(), String> {
         if self.dev.busy.load(Ordering::Acquire) {
-            Err("the GPU may still be running work after a failed wait".into())
+            Err("the GPU may still be running work".into())
         } else if self.unreset_fence {
             Err("a fence of the GPU failed to reset".into())
         } else {
