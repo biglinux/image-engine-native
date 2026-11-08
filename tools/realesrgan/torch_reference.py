@@ -58,10 +58,18 @@ def main():
     parser.add_argument("rgb_dir")
     parser.add_argument("--threads", type=int, default=4)
     args = parser.parse_args()
+    if (args.weak is None) != (args.strength is None):
+        parser.error("--weak and --strength go together")
+    if args.weak and not 0 <= args.strength <= 1:
+        parser.error("--strength is between 0 and 1")
     torch.set_num_threads(args.threads)
     state = params(args.model)
     if args.weak:
         weak = params(args.weak)
+        if weak.keys() != state.keys() or any(
+            weak[k].shape != v.shape for k, v in state.items()
+        ):
+            raise SystemExit("the two checkpoints hold different tensors")
         state = {
             k: args.strength * v + (1 - args.strength) * weak[k]
             for k, v in state.items()

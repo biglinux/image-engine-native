@@ -85,7 +85,9 @@ def main():
         if not 0 <= args.strength <= 1:
             parser.error("--strength is between 0 and 1")
         weak = load(args.weak)
-        if weak.keys() != state.keys():
+        if weak.keys() != state.keys() or any(
+            weak[k].shape != v.shape for k, v in state.items()
+        ):
             raise SystemExit("the two checkpoints hold different tensors")
         s = np.float32(args.strength)
         state = {k: s * v + (np.float32(1) - s) * weak[k] for k, v in state.items()}
