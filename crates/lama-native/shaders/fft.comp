@@ -1,0 +1,197 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// One pass of dft.comp by a fast transform: a workgroup takes one row or
+// column of up to NMAX points for C channels, in shared memory, through a
+// mixed-radix Stockham transform (radix 4 while it divides the length, then
+// 2, then each odd prime factor, 3, 5 and 7 from registers, larger ones by
+// direct sums), with the twiddles of the host's table. The row passes
+// transform whole complex lines: pass 0 the real row, pass 3 the spectrum
+// completed by its symmetry, the imaginary parts of the first and, for an
+// even width, the last column left out as irfftn does.
+#ifndef C
+#define C 8
+#endif
+#ifndef NMAX
+#define NMAX 128
+#endif
+const int LS = 256;
+layout(local_size_x = LS) in;
+layout(std430, binding = 0) readonly restrict buffer Half { float16_t half_in[]; };
+layout(std430, binding = 1) readonly restrict buffer Wide { float wide_in[]; };
+layout(std430, binding = 2) writeonly restrict buffer HalfOut { float16_t half_out[]; };
+layout(std430, binding = 3) writeonly restrict buffer WideOut { float wide_out[]; };
+layout(std430, binding = 4) readonly restrict buffer Residual { float16_t residual[]; };
+layout(std430, binding = 5) readonly restrict buffer Twiddles { vec2 twiddles[]; };
+layout(push_constant) uniform PC {
+    int pass_; int height; int width; int c;
+} pc;
+
+shared vec2 buf[2][NMAX * C];
+// exp(sign 2 pi i j / n).
+shared vec2 tw[NMAX];
+
+vec2 mul(vec2 a, vec2 b) {
+    return vec2(a.x * b.x - a.y * b.y, a.x * b.y + a.y * b.x);
+}
+
+// The stage's radix for the `left` points still to combine.
+int radix(int left) {
+    if (left % 4 == 0)
+        return 4;
+    if (left % 2 == 0)
+        return 2;
+    for (int p = 3; p * p <= left; p += 2)
+        if (left % p == 0)
+            return p;
+    return left;
+}
+
+void main() {
+    int t = int(gl_LocalInvocationID.x);
+    int c0 = int(gl_WorkGroupID.x) * C;
+    int line = int(gl_WorkGroupID.y);
+    int half_ = pc.width / 2 + 1;
+    int c = pc.c;
+    bool rows = pc.pass_ == 0 || pc.pass_ == 3;
+    int n = rows ? pc.width : pc.height;
+    int table = rows ? 0 : pc.width;
+    float sign = pc.pass_ <= 1 ? -1.0 : 1.0;
+    int nyquist = pc.width % 2 == 0 ? pc.width / 2 : -1;
+    for (int i = t; i < n; i += LS) {
+        vec2 w = twiddles[table + i];
+        tw[i] = vec2(w.x, sign * w.y);
+    }
+    for (int i = t; i < n * C; i += LS) {
+        int k = i / C;
+        int ch = c0 + i - k * C;
+        vec2 v = vec2(0.0);
+        if (ch < c) {
+            if (pc.pass_ == 0) {
+                v.x = float(half_in[(line * pc.width + k) * c + ch]);
+            } else if (pc.pass_ == 3) {
+                int at = (line * half_ + (k < half_ ? k : n - k)) * 2 * c + ch;
+                v = vec2(wide_in[at], wide_in[at + c]);
+                if (k == 0 || k == nyquist)
+                    v.y = 0.0;
+                else if (k >= half_)
+                    v.y = -v.y;
+            } else {
+                int at = (k * half_ + line) * 2 * c + ch;
+                v = pc.pass_ == 1 ? vec2(wide_in[at], wide_in[at + c])
+                                  : vec2(float(half_in[at]), float(half_in[at + c]));
+            }
+        }
+        buf[0][i] = v;
+    }
+    barrier();
+
+    // A stage of radix R, after stages whose radices multiply to ns, takes
+    // butterfly j's inputs j + r n / R, turns input r by the twiddle of
+    // r (j % ns) n / (ns R), and writes their R-point transform's output k
+    // to k ns + (j % ns) + (j / ns) ns R.
+    int src = 0;
+    int ns = 1;
+    for (int left = n; left > 1;) {
+        int R = radix(left);
+        int m = n / R;
+        int step = n / (ns * R);
+        for (int i = t; i < m * C; i += LS) {
+            int j = i / C;
+            int cl = i - j * C;
+            int low = j % ns;
+            int at = ((j - low) * R + low) * C + cl;
+            int turn = low * step;
+            if (R == 4) {
+                vec2 v0 = buf[src][j * C + cl];
+                vec2 v1 = mul(buf[src][(j + m) * C + cl], tw[turn]);
+                vec2 v2 = mul(buf[src][(j + 2 * m) * C + cl], tw[2 * turn]);
+                vec2 v3 = mul(buf[src][(j + 3 * m) * C + cl], tw[3 * turn]);
+                vec2 a = v0 + v2;
+                vec2 b = v0 - v2;
+                vec2 e = v1 + v3;
+                // (v1 - v3) times exp(sign i pi / 2).
+                vec2 d = sign * vec2(v3.y - v1.y, v1.x - v3.x);
+                buf[1 - src][at] = a + e;
+                buf[1 - src][at + ns * C] = b + d;
+                buf[1 - src][at + 2 * ns * C] = a - e;
+                buf[1 - src][at + 3 * ns * C] = b - d;
+            } else if (R == 2) {
+                vec2 v0 = buf[src][j * C + cl];
+                vec2 v1 = mul(buf[src][(j + m) * C + cl], tw[turn]);
+                buf[1 - src][at] = v0 + v1;
+                buf[1 - src][at + ns * C] = v0 - v1;
+            } else if (R == 3) {
+                vec2 v[3];
+                [[unroll]] for (int r = 0; r < 3; r++)
+                    v[r] = mul(buf[src][(j + r * m) * C + cl], tw[r * turn]);
+                [[unroll]] for (int k = 0; k < 3; k++) {
+                    vec2 sum = v[0];
+                    [[unroll]] for (int r = 1; r < 3; r++)
+                        sum += mul(v[r], tw[(r * k % 3) * m]);
+                    buf[1 - src][at + k * ns * C] = sum;
+                }
+            } else if (R == 5) {
+                vec2 v[5];
+                [[unroll]] for (int r = 0; r < 5; r++)
+                    v[r] = mul(buf[src][(j + r * m) * C + cl], tw[r * turn]);
+                [[unroll]] for (int k = 0; k < 5; k++) {
+                    vec2 sum = v[0];
+                    [[unroll]] for (int r = 1; r < 5; r++)
+                        sum += mul(v[r], tw[(r * k % 5) * m]);
+                    buf[1 - src][at + k * ns * C] = sum;
+                }
+            } else if (R == 7) {
+                vec2 v[7];
+                [[unroll]] for (int r = 0; r < 7; r++)
+                    v[r] = mul(buf[src][(j + r * m) * C + cl], tw[r * turn]);
+                [[unroll]] for (int k = 0; k < 7; k++) {
+                    vec2 sum = v[0];
+                    [[unroll]] for (int r = 1; r < 7; r++)
+                        sum += mul(v[r], tw[(r * k % 7) * m]);
+                    buf[1 - src][at + k * ns * C] = sum;
+                }
+            } else {
+                for (int k = 0; k < R; k++) {
+                    vec2 sum = vec2(0.0);
+                    for (int r = 0; r < R; r++) {
+                        vec2 x = mul(buf[src][(j + r * m) * C + cl], tw[r * turn]);
+                        sum += mul(x, tw[(r * k % R) * m]);
+                    }
+                    buf[1 - src][at + k * ns * C] = sum;
+                }
+            }
+        }
+        barrier();
+        src = 1 - src;
+        left /= R;
+        ns *= R;
+    }
+
+    float scale = inversesqrt(float(pc.height * pc.width));
+    int outs = pc.pass_ == 0 ? half_ : n;
+    for (int i = t; i < outs * C; i += LS) {
+        int o = i / C;
+        int ch = c0 + i - o * C;
+        if (ch >= c)
+            continue;
+        vec2 v = buf[src][i];
+        if (pc.pass_ == 0) {
+            int at = (line * half_ + o) * 2 * c + ch;
+            wide_out[at] = v.x;
+            wide_out[at + c] = v.y;
+        } else if (pc.pass_ == 1) {
+            int at = (o * half_ + line) * 2 * c + ch;
+            half_out[at] = float16_t(v.x * scale);
+            half_out[at + c] = float16_t(v.y * scale);
+        } else if (pc.pass_ == 2) {
+            int at = (o * half_ + line) * 2 * c + ch;
+            wide_out[at] = v.x;
+            wide_out[at + c] = v.y;
+        } else {
+            int at = (line * pc.width + o) * c + ch;
+            half_out[at] = float16_t(v.x * scale + float(residual[at]));
+        }
+    }
+}

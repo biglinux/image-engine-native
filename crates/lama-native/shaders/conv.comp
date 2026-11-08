@@ -1,0 +1,162 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_ballot : require
+// K x K convolution of stride S in half floats, NHWC with any pixel strides,
+// padded by reflection, plus bias and a ReLU or sigmoid, written or added
+// before the activation. One wave of 64 lanes covers 8 rows of 8 PX output
+// pixels, PX neighbours per lane, for CO output channels per workgroup row
+// of the grid; the weights' index is the same in every lane, so AMD GPUs
+// read them through the scalar cache. The products of each block of CK input
+// channels (16, or the first layer's 4) and one kernel row are summed in half
+// floats and the blocks in floats; all nine taps in one half-float sum round
+// enough to change the fills of large images. Weights are
+// [tap][cin][cout padded to 64].
+#ifndef K
+#define K 3
+#endif
+#ifndef S
+#define S 1
+#endif
+// Output channels per wave. On AMD the first 7x7 convolution runs two waves
+// of 32 channels per workgroup (the 3x3 ones run in conv_lanes.comp, the
+// last layer in conv7_last.comp). Other GPUs read each weight from memory and
+// run it with PX 4 and CO 32.
+#ifndef CO
+#define CO 64
+#endif
+// Horizontally adjacent output pixels per lane, each weight read serving
+// PX products.
+#ifndef PX
+#define PX 1
+#endif
+// Waves per workgroup, each with its own CO output channels of the same
+// pixels, sharing the input tile.
+#ifndef WAVES
+#define WAVES 1
+#endif
+layout(local_size_x = 64 * WAVES) in;
+layout(std430, binding = 0) readonly restrict buffer Src { f16vec4 src4[]; };
+layout(std430, binding = 1) restrict buffer Dst { float16_t dst[]; };
+layout(std430, binding = 1) restrict buffer Dst16 { uvec4 dst16[]; };
+layout(std430, binding = 2) readonly restrict buffer Params { f16vec2 params[]; };
+layout(push_constant) uniform PC {
+    int W; int H; int OW; int OH; int cin; int src_stride; int cout; int dst_stride;
+    int dst_off; int w_off; int b_off; int act; int accumulate;
+} pc;
+
+// Input channels per tile: 4 for the first layer's four.
+#ifndef CK
+#define CK 16
+#endif
+const int P = K / 2;
+const int SW = 8 * S + K - S;
+const int SWX = 8 * PX * S + K - S;
+shared float16_t tile[CK * SW * SWX];
+
+int reflect(int i, int n) {
+    return min(abs(i), 2 * (n - 1) - i);
+}
+
+float activate(float v) {
+    if (pc.act == 1)
+        return max(v, 0.0);
+    if (pc.act == 2)
+        return 1.0 / (1.0 + exp(-v));
+    return v;
+}
+
+void main() {
+    int id = int(gl_LocalInvocationID.x);
+    int t = id & 63;
+    // Uniform in each wave; the broadcast lets the compiler see it.
+    int wave = subgroupBroadcastFirst(id >> 6);
+    int lx = t % 8;
+    int ly = t / 8;
+    int x0 = int(gl_WorkGroupID.x) * 8 * PX;
+    int y0 = int(gl_WorkGroupID.y) * 8;
+    int co0 = (int(gl_WorkGroupID.z) * WAVES + wave) * CO;
+    int np = (pc.cout + 63) & ~63;
+    vec2 total[PX][CO / 2];
+    [[unroll]] for (int p = 0; p < PX; p++)
+        [[unroll]] for (int j = 0; j < CO / 2; j++)
+            total[p][j] = vec2(0.0);
+    for (int c0 = 0; c0 < pc.cin; c0 += CK) {
+        int ck = min(CK, pc.cin - c0);
+        // Four channels of a pixel per load: cin and the pixel stride are
+        // multiples of 4.
+        for (int i = id; i < SW * SWX * CK / 4; i += 64 * WAVES) {
+            int c = 4 * (i % (CK / 4));
+            int q = i / (CK / 4);
+            int y = reflect(y0 * S - P + q / SWX, pc.H);
+            int x = reflect(x0 * S - P + q % SWX, pc.W);
+            f16vec4 v = f16vec4(0.0);
+            if (c < ck)
+                v = src4[((y * pc.W + x) * pc.src_stride + c0 + c) >> 2];
+            [[unroll]] for (int j = 0; j < 4; j++)
+                tile[((c + j) * SW + q / SWX) * SWX + q % SWX] = v[j];
+        }
+        barrier();
+        [[unroll]] for (int ky = 0; ky < K; ky++) {
+            f16vec2 acc[PX][CO / 2];
+            [[unroll]] for (int p = 0; p < PX; p++)
+                [[unroll]] for (int j = 0; j < CO / 2; j++)
+                    acc[p][j] = f16vec2(0.0);
+            for (int c = 0; c < ck; c++) {
+                [[unroll]] for (int kx = 0; kx < K; kx++) {
+                    int tap = ky * K + kx;
+                    int wb = (pc.w_off + (tap * pc.cin + c0 + c) * np + co0) >> 1;
+                    int tb = (c * SW + ly * S + ky) * SWX + lx * PX * S + kx;
+                    [[unroll]] for (int j = 0; j < CO / 2; j++) {
+                        f16vec2 w = params[wb + j];
+                        [[unroll]] for (int p = 0; p < PX; p++)
+                            acc[p][j] = fma(f16vec2(tile[tb + p * S]), w, acc[p][j]);
+                    }
+                }
+            }
+            [[unroll]] for (int p = 0; p < PX; p++)
+                [[unroll]] for (int j = 0; j < CO / 2; j++)
+                    total[p][j] += vec2(acc[p][j]);
+        }
+        barrier();
+    }
+    int y = y0 + ly;
+    [[unroll]] for (int p = 0; p < PX; p++) {
+        int x = x0 + lx * PX + p;
+        if (x >= pc.OW || y >= pc.OH)
+            return;
+        int o = (y * pc.OW + x) * pc.dst_stride + pc.dst_off + co0;
+        // A lane's pixel is apart from its neighbours', so where eight channels
+        // are aligned they go out in one 16-byte write instead of eight.
+        [[unroll]] for (int q = 0; q < (CO + 7) / 8; q++) {
+            int c = co0 + 8 * q;
+            if (8 * q + 8 <= CO && c + 8 <= pc.cout && ((o + 8 * q) & 7) == 0) {
+                int i = (o >> 3) + q;
+                uvec4 old = pc.accumulate != 0 ? dst16[i] : uvec4(0);
+                uvec4 w;
+                [[unroll]] for (int h = 0; h < 4; h++) {
+                    vec2 v = total[p][4 * q + h];
+                    if (pc.b_off >= 0)
+                        v += vec2(params[(pc.b_off + c + 2 * h) >> 1]);
+                    if (pc.accumulate != 0)
+                        v += vec2(unpackFloat2x16(old[h]));
+                    w[h] = packFloat2x16(f16vec2(activate(v.x), activate(v.y)));
+                }
+                dst16[i] = w;
+                continue;
+            }
+            [[unroll]] for (int e = 0; e < 8 && 8 * q + e < CO; e++) {
+                int co = c + e;
+                if (co >= pc.cout)
+                    break;
+                float v = total[p][4 * q + (e >> 1)][e & 1];
+                if (pc.b_off >= 0)
+                    v += float(params[(pc.b_off + co) >> 1][co & 1]);
+                if (pc.accumulate != 0)
+                    v += float(dst[o + 8 * q + e]);
+                dst[o + 8 * q + e] = float16_t(activate(v));
+            }
+        }
+    }
+}

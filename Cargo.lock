@@ -11,6 +11,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "lama-native"
+version = "0.1.0"
+dependencies = [
+ "native-engine",
+ "native-vulkan",
+]
+
+[[package]]
 name = "native-engine"
 version = "0.1.0"
 
