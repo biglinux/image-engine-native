@@ -11,6 +11,7 @@ read past its storage is refused.
 """
 
 import collections
+import operator
 import pickle
 import zipfile
 
@@ -47,7 +48,13 @@ class Inert:
 
 def rebuild_tensor(storage, offset, size, stride, *_):
     # as_strided reads wherever the strides lead, so the view must stay
-    # inside its storage.
+    # inside a one-dimensional storage, its bounds summed in Python integers,
+    # which do not wrap as numpy's do.
+    if not (isinstance(storage, np.ndarray) and storage.ndim == 1):
+        raise pickle.UnpicklingError("tensor storage is not a plain array")
+    offset = operator.index(offset)
+    size = [operator.index(n) for n in size]
+    stride = [operator.index(s) for s in stride]
     if len(size) != len(stride) or min([offset, *size, *stride]) < 0:
         raise pickle.UnpicklingError(f"bad tensor view {offset} {size} {stride}")
     if 0 not in size:
