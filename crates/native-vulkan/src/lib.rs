@@ -94,7 +94,6 @@ pub struct Gpu {
     name: String,
     vendor: u32,
     shared_memory: u32,
-    invocations: u32,
     groups: [u32; 3],
     /// Bytes a storage buffer may span in a shader.
     storage_range: u32,
@@ -121,9 +120,10 @@ impl Drop for Gpu {
 }
 
 impl Gpu {
-    /// Open the best GPU that has Vulkan 1.2 with half-float arithmetic and
-    /// 16-bit storage: a discrete one first, then an integrated one. CPU
-    /// implementations such as llvmpipe are left out.
+    /// Open the best GPU that has Vulkan 1.2 with half-float arithmetic,
+    /// 16-bit storage and workgroups of 256 invocations: a discrete one
+    /// first, then an integrated one. CPU implementations such as llvmpipe
+    /// are left out.
     pub fn open() -> Result<Self, String> {
         let instance = create_instance()?;
         let choice = choose(&instance)?;
@@ -153,7 +153,6 @@ impl Gpu {
             name: device_name(&choice.props),
             vendor: choice.props.vendor_id,
             shared_memory: limits.max_compute_shared_memory_size,
-            invocations: limits.max_compute_work_group_invocations,
             groups: limits.max_compute_work_group_count,
             storage_range: limits.max_storage_buffer_range,
         };
@@ -229,11 +228,6 @@ impl Gpu {
     /// Bytes of shared memory a workgroup may use.
     pub fn max_shared_memory(&self) -> u32 {
         self.shared_memory
-    }
-
-    /// Invocations a workgroup may have.
-    pub fn max_invocations(&self) -> u32 {
-        self.invocations
     }
 
     /// A storage buffer of `size` bytes in the GPU's own memory.

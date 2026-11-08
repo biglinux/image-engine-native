@@ -36,7 +36,6 @@ const CONV_SHARED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv_shared
 const CONV_SHARED_S2: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv_shared_s2.spv"));
 /// What the `_shared` kernels need of a workgroup.
 const SHARED_BYTES: u32 = 39_552;
-const SHARED_INVOCATIONS: u32 = 256;
 const AMD: u32 = 0x1002;
 const INTEL: u32 = 0x8086;
 const DFT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/dft.spv"));
@@ -529,9 +528,7 @@ impl Network {
 
         let mut gpu = Gpu::open().map_err(Error::Gpu)?;
         let kernel = |spirv, bindings, push| gpu.kernel(spirv, bindings, push).map_err(Error::Gpu);
-        let shared = gpu.vendor() != AMD
-            && gpu.max_shared_memory() >= SHARED_BYTES
-            && gpu.max_invocations() >= SHARED_INVOCATIONS;
+        let shared = gpu.vendor() != AMD && gpu.max_shared_memory() >= SHARED_BYTES;
         let (conv7, conv7_columns) = match (shared, gpu.vendor()) {
             (false, _) => (CONV7, 8),
             (true, INTEL) => (CONV7_PX2, 16),

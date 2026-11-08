@@ -37,7 +37,6 @@ macro_rules! spirv {
 const AMD: u32 = 0x1002;
 /// What `gemm_shared` needs of a workgroup.
 const SHARED_BYTES: u32 = 13_824;
-const SHARED_INVOCATIONS: u32 = 256;
 /// Bytes of `gemm`'s push constants.
 const GEMM_PUSH: u32 = 96;
 /// Fewer workgroups than this split a product along k.
@@ -429,10 +428,7 @@ impl Network {
         let (layers, params) = Layers::load(path)?;
         let mut gpu = Gpu::open().map_err(Error::Gpu)?;
         let kernel = |spirv, bindings, push| gpu.kernel(spirv, bindings, push).map_err(Error::Gpu);
-        let gemm = if gpu.vendor() != AMD
-            && gpu.max_shared_memory() >= SHARED_BYTES
-            && gpu.max_invocations() >= SHARED_INVOCATIONS
-        {
+        let gemm = if gpu.vendor() != AMD && gpu.max_shared_memory() >= SHARED_BYTES {
             Products::Shared(kernel(spirv!("gemm_shared"), 4, GEMM_PUSH)?)
         } else {
             Products::Scalar([

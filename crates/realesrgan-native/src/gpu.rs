@@ -29,7 +29,6 @@ const CONV_SHARED_PX4: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/conv_sh
 const SHUFFLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shuffle.spv"));
 /// What `conv_shared` needs of a workgroup.
 const SHARED_BYTES: u32 = 31_488;
-const SHARED_INVOCATIONS: u32 = 256;
 const AMD: u32 = 0x1002;
 const INTEL: u32 = 0x8086;
 /// Bytes of the push constants: width, height, input channels and the
@@ -88,9 +87,7 @@ impl Network {
         let (words, layers) = params(&mut file)?;
         file.finish()?;
         let mut gpu = Gpu::open().map_err(Error::Gpu)?;
-        let shared = gpu.vendor() != AMD
-            && gpu.max_shared_memory() >= SHARED_BYTES
-            && gpu.max_invocations() >= SHARED_INVOCATIONS;
+        let shared = gpu.vendor() != AMD && gpu.max_shared_memory() >= SHARED_BYTES;
         // Intel's compiler spills the sums of eight pixels out of registers.
         let (spirv, block) = if shared && gpu.vendor() == INTEL {
             (CONV_SHARED_PX4, (8, 16))
