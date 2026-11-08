@@ -30,16 +30,20 @@ from PIL import Image
 def prepare(args):
     out = pathlib.Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
-    names = set()
+    photos = {}
     for path in sorted(pathlib.Path(args.img_dir).iterdir()):
         try:
-            image = Image.open(path).convert("RGB")
+            with Image.open(path) as image:
+                image.load()
         except OSError:
             print(f"skipped {path.name}: not an image", file=sys.stderr)
             continue
-        if path.stem in names:
-            sys.exit(f"{path.name}: another photo is also named {path.stem}")
-        names.add(path.stem)
+        # Names that differ in case only collide on some file systems.
+        other = photos.setdefault(path.stem.casefold(), path)
+        if other != path:
+            sys.exit(f"{path.name} and {other.name} would write the same files")
+    for path in photos.values():
+        image = Image.open(path).convert("RGB")
         w, h = image.size
         scale = min(w / args.width, h / args.height)
         cw, ch = args.width * scale, args.height * scale

@@ -61,16 +61,20 @@ def prepare(args):
 
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    names = set()
+    photos = {}
     for path in sorted(pathlib.Path(args.images).iterdir()):
         try:
-            image = Image.open(path).convert("RGB")
+            with Image.open(path) as image:
+                image.load()
         except OSError:
             print(f"{path.name}: not an image, skipped", file=sys.stderr)
             continue
-        if path.stem in names:
-            sys.exit(f"{path.name}: another photo is also named {path.stem}")
-        names.add(path.stem)
+        # Names that differ in case only collide on some file systems.
+        other = photos.setdefault(path.stem.casefold(), path)
+        if other != path:
+            sys.exit(f"{path.name} and {other.name} would write the same files")
+    for path in photos.values():
+        image = Image.open(path).convert("RGB")
         image = image.resize((args.side, args.side), Image.LANCZOS)
         np.asarray(image, dtype=np.uint8).tofile(out / f"{path.stem}.rgb")
         print(path.stem)
