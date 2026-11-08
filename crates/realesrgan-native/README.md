@@ -134,7 +134,7 @@ x86-64 CPU (tier 0), with plain Rust on other architectures.
 
 ## Performance
 
-As direct convolutions a run costs 2.4 GFLOP per input pixel, 238 GFLOP for a
+As direct convolutions a run costs 2.4 MFLOP per input pixel, 238 GFLOP for a
 384 x 256 image; the Winograd convolutions do it with four times fewer
 multiplications. On a Ryzen 5 5600H (Zen 3, 6 cores, 12 threads, AVX2), 6
 threads, peak resident memory of the whole process, one image:
@@ -199,7 +199,7 @@ them and the progress reports:
 cargo test --release
 REALESRGAN_NATIVE_WEIGHTS=$PWD/weights/realesr-general-x4v3-dn50.weights \
   REALESRGAN_NATIVE_REFERENCE=DIR REALESRGAN_NATIVE_SIZE=384x256 \
-  cargo test --release -- --ignored
+  cargo test --release --test reference -- --ignored
 ```
 
 The ignored `gpu` test needs a GPU and checks it against the CPU engine on

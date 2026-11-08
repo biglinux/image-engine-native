@@ -1,8 +1,8 @@
 # image-engine-native
 
 Run image AI models without PyTorch, ONNX Runtime or Python. Four models,
-written out by hand in plain Rust, running on the CPU or on any GPU with a
-Vulkan driver.
+written out by hand in plain Rust, running on the CPU or on a GPU through
+Vulkan.
 
 | Model | What it does | Crate | Weights |
 |---|---|---|---:|
@@ -11,8 +11,10 @@ Vulkan driver.
 | Real-ESRGAN general x4v3 | upscales 4x | [realesrgan-native](crates/realesrgan-native) | 4.9 MB |
 | Big LaMa | fills in a masked area | [lama-native](crates/lama-native) | 102 MB |
 
-- No dependencies beyond Rust's standard library.
-- Uses the GPU when there is one, falls back to the CPU when there isn't.
+- No crates beyond Rust's standard library; building needs `glslc` for the
+  shaders.
+- Uses a GPU with Vulkan 1.2, half floats, 16-bit storage and workgroups of
+  256 invocations when there is one, and the CPU when there isn't.
 - Every model is checked against the original model running in PyTorch.
 
 Each crate's README covers its API, bigger images, memory use and how to
@@ -191,7 +193,7 @@ without getting worse against the original photos (details in its README).
   output is still in cache, instead of in separate passes.
 - **Memory that comes and goes.** Each intermediate map lives only as long as
   it's needed, and buffers get reused. SCUNet and Real-ESRGAN can take big
-  images in tiles, so memory doesn't grow with image size.
+  images in tiles, so only the input and output grow with image size.
 - **Deterministic threads.** Work is split by rows, never inside a sum, so
   you get the same result with 1 thread or 16.
 

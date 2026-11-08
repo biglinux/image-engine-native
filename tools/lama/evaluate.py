@@ -8,7 +8,7 @@ prepare crops every photo of IMG_DIR to the WIDTH:HEIGHT shape around its
 centre and resizes it to WIDTH x HEIGHT (Lanczos), writing NAME.rgb (8-bit
 RGB rows) and NAME.mask (a byte per pixel, 255 where the photo is to be
 filled): a few thick strokes and a box, drawn at random from a generator
-seeded by the name, covering 7 to 22 % of the photo.
+seeded by the name; prepare prints the share of each photo they cover.
 
 compare reads NAME.TAG.out (the prediction for every pixel, float32 RGB rows,
 as lama-bench --tag and torch_reference.py write them) for every NAME.rgb in

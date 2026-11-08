@@ -207,7 +207,7 @@ GTX 1660 Ti, the mean by 0.03 and 0.01 dB.
 ## Checking results
 
 `tools/lama/evaluate.py prepare` crops and resizes photos and draws holes in
-them (strokes and a box, 7 to 22 % of the photo);
+them (strokes and a box);
 `tools/lama/torch_reference.py` writes PyTorch's predictions with LaMa's own
 generator code; `tools/lama/evaluate.py compare` prints the PSNR inside the
 holes and the differences between two sets of predictions. With a directory of
