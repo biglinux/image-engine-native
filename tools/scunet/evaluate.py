@@ -62,8 +62,9 @@ def psnr(a, b):
 
 
 def to_8bit(out):
-    # Halves round up, as Model::run's f32::round does for these values.
-    return np.floor(out.clip(0, 1) * 255 + 0.5)
+    # Scaled in float32 as Model::run does, then halves rounded up as its
+    # f32::round does, the sum taken in float64 so that it is exact.
+    return np.floor((out.clip(0, 1) * np.float32(255)).astype(np.float64) + 0.5)
 
 
 def compare(args):
