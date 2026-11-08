@@ -1,0 +1,51 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Bilinear resize with aligned corners, as ONNX Runtime computes it, of a
+// `sh x sw x c` map into channels `dst_off..dst_off + c` of the `dh x dw`
+// pixels of `dst`, `dst_stride` apart; added to what is there when `add`.
+// An invocation per output value.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly restrict buffer Src { float16_t src[]; };
+layout(std430, binding = 1) restrict buffer Dst { float16_t dst[]; };
+layout(push_constant) uniform PC {
+    int sh; int sw; int dh; int dw; int c; int dst_stride; int dst_off; int add;
+} pc;
+
+// Source indices and weights along one axis.
+void axis(int o, int len_in, int len_out, out int i0, out int i1, out float w0, out float w1) {
+    float pos = len_out == 1 ? 0.0 : float(o) * float(len_in - 1) / float(len_out - 1);
+    pos = clamp(pos, 0.0, float(len_in - 1));
+    i0 = int(pos);
+    i1 = min(i0 + 1, len_in - 1);
+    if (i0 == i1) {
+        w0 = 0.5;
+        w1 = 0.5;
+    } else {
+        // The weight of i0 is the distance to i1, and the other way round.
+        w0 = abs(pos - float(i1));
+        w1 = abs(pos - float(i0));
+    }
+}
+
+void main() {
+    int e = int(gl_WorkGroupID.y * 65535u * 256u + gl_GlobalInvocationID.x);
+    if (e >= pc.dh * pc.dw * pc.c)
+        return;
+    int p = e / pc.c;
+    int ch = e - p * pc.c;
+    int y = p / pc.dw;
+    int x = p - y * pc.dw;
+    int y1, y2, x1, x2;
+    float wy1, wy2, wx1, wx2;
+    axis(y, pc.sh, pc.dh, y1, y2, wy1, wy2);
+    axis(x, pc.sw, pc.dw, x1, x2, wx1, wx2);
+    float v = wx1 * wy1 * float(src[(y1 * pc.sw + x1) * pc.c + ch])
+        + wx2 * wy1 * float(src[(y1 * pc.sw + x2) * pc.c + ch])
+        + wx1 * wy2 * float(src[(y2 * pc.sw + x1) * pc.c + ch])
+        + wx2 * wy2 * float(src[(y2 * pc.sw + x2) * pc.c + ch]);
+    int at = p * pc.dst_stride + pc.dst_off + ch;
+    if (pc.add != 0)
+        v += float(dst[at]);
+    dst[at] = float16_t(v);
+}

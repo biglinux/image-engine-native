@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "birefnet-native"
+version = "0.1.0"
+dependencies = [
+ "native-engine",
+ "native-vulkan",
+]
+
+[[package]]
 name = "native-engine"
 version = "0.1.0"
 

@@ -1,0 +1,18 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Each pixel's `c` channels times its gate, an invocation per pair.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly restrict buffer Gates { float16_t gates[]; };
+layout(std430, binding = 1) restrict buffer Map { f16vec2 map[]; };
+layout(push_constant) uniform PC {
+    int pixels; int c;
+} pc;
+
+void main() {
+    int e = int(gl_WorkGroupID.y * 65535u * 256u + gl_GlobalInvocationID.x);
+    int pairs = pc.c >> 1;
+    if (e >= pc.pixels * pairs)
+        return;
+    map[e] = f16vec2(vec2(map[e]) * float(gates[e / pairs]));
+}

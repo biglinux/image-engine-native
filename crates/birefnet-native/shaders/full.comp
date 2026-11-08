@@ -1,0 +1,88 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// The full-resolution patch branch with the head folded in, added to each
+// pixel's logit: two 3x3 convolutions (3 to 64 channels, 64 to 1) without
+// an activation, which compose into one 5x5 convolution wherever the
+// intermediate map's zero padding is not reached: an invocation per interior
+// pixel. Pixels on the image's edge, where it is, run the two convolutions
+// one after the other in a second pass (`edge`), 64 invocations per pixel,
+// one per intermediate channel; done with the interior, one lane in a wave
+// would hold the whole wave.
+//
+// Parameters from `at`, in floats: the composed weights [(ky, kx, c)] and
+// bias (76), the first convolution's weights [(ky, kx, c)][64] and bias (64),
+// the second's [(ky, kx, k)] and bias (577).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly restrict buffer Image { float16_t image[]; };
+layout(std430, binding = 1) restrict buffer Logits { float16_t logits[]; };
+layout(std430, binding = 2) readonly restrict buffer Params { float pf[]; };
+layout(push_constant) uniform PC {
+    int side; int at; int edge;
+} pc;
+
+shared float part[256];
+
+float pixel(int y, int x, int c) {
+    if (y < 0 || x < 0 || y >= pc.side || x >= pc.side)
+        return 0.0;
+    return float(image[(y * pc.side + x) * 3 + c]);
+}
+
+void main() {
+    int conv1 = pc.at + 76;
+    int bias1 = conv1 + 27 * 64;
+    int conv2 = bias1 + 64;
+    if (pc.edge == 0) {
+        int p = int(gl_WorkGroupID.y * 65535u * 256u + gl_GlobalInvocationID.x);
+        int y = p / pc.side;
+        int x = p - y * pc.side;
+        if (p >= pc.side * pc.side || y == 0 || x == 0 || y == pc.side - 1 || x == pc.side - 1)
+            return;
+        float s = pf[pc.at + 75];
+        for (int e = 0; e < 25; e++)
+            for (int c = 0; c < 3; c++)
+                s = fma(pf[pc.at + e * 3 + c], pixel(y - 2 + e / 5, x - 2 + e % 5, c), s);
+        logits[p] = float16_t(float(logits[p]) + s);
+        return;
+    }
+    // Edge pixel n: the top row, the bottom row, then the left and right
+    // columns between them.
+    int lid = int(gl_LocalInvocationID.x);
+    int n = int(gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x) * 4 + (lid >> 6);
+    int k = lid & 63;
+    int side = pc.side;
+    int y, x;
+    if (n < 2 * side) {
+        y = n < side ? 0 : side - 1;
+        x = n % side;
+    } else {
+        int m = n - 2 * side;
+        y = 1 + (m >> 1);
+        x = (m & 1) * (side - 1);
+    }
+    float s = 0.0;
+    if (n < 4 * side - 4) {
+        for (int d = 0; d < 9; d++) {
+            int qy = y + d / 3 - 1;
+            int qx = x + d % 3 - 1;
+            if (qy < 0 || qx < 0 || qy >= side || qx >= side)
+                continue;
+            float mid = pf[bias1 + k];
+            for (int e = 0; e < 9; e++)
+                for (int c = 0; c < 3; c++)
+                    mid = fma(pixel(qy + e / 3 - 1, qx + e % 3 - 1, c), pf[conv1 + (e * 3 + c) * 64 + k], mid);
+            s = fma(mid, pf[conv2 + d * 64 + k], s);
+        }
+    }
+    part[lid] = s;
+    for (int h = 32; h > 0; h >>= 1) {
+        barrier();
+        if (k < h)
+            part[lid] += part[lid + h];
+    }
+    if (k == 0 && n < 4 * side - 4) {
+        int p = y * side + x;
+        logits[p] = float16_t(float(logits[p]) + part[lid] + pf[conv2 + 576]);
+    }
+}

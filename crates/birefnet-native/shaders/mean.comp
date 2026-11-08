@@ -1,0 +1,25 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// The mean of each of the 64 channels over `pixels` pixels, in one
+// workgroup: four lanes per channel, each summing every fourth pixel.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly restrict buffer Src { float16_t src[]; };
+layout(std430, binding = 1) writeonly restrict buffer Dst { float16_t dst[]; };
+layout(push_constant) uniform PC {
+    int pixels;
+} pc;
+
+shared float partial[256];
+
+void main() {
+    int t = int(gl_LocalInvocationID.x);
+    int ch = t & 63;
+    float sum = 0.0;
+    for (int p = t >> 6; p < pc.pixels; p += 4)
+        sum += float(src[p * 64 + ch]);
+    partial[t] = sum;
+    barrier();
+    if (t < 64)
+        dst[t] = float16_t((partial[t] + partial[t + 64] + partial[t + 128] + partial[t + 192]) / float(pc.pixels));
+}

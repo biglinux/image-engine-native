@@ -1,0 +1,33 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_GOOGLE_include_directive : require
+// The layer normalisation of a product's input rows, once for all of its
+// workgroups: each row's mean and inverse deviation as two floats, summed by
+// one lane in order of k, as the products did on their own.
+layout(local_size_x = 64) in;
+
+#include "gemm_layout.glsl"
+
+void main() {
+    int r = int(gl_GlobalInvocationID.x);
+    if (r >= pc.rows)
+        return;
+    int start = row_start(pc.in_mode, r, pc.src_stride, pc.src_off);
+    float sum = 0.0;
+    float squares = 0.0;
+    for (int k0 = 0; k0 < pc.k; k0 += 16) {
+        Chunk ch = chunk(k0);
+        [[unroll]] for (int q = 0; q < 4; q++) {
+            vec4 v = vec4(load4(start, ch, q));
+            [[unroll]] for (int j = 0; j < 4; j++) {
+                sum += v[j];
+                squares = fma(v[j], v[j], squares);
+            }
+        }
+    }
+    float m = sum / float(pc.k);
+    dstf[2 * r] = m;
+    dstf[2 * r + 1] = inversesqrt(max(squares / float(pc.k) - m * m, 0.0) + 1e-5);
+}

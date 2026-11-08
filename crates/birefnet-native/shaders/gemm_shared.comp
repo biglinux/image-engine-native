@@ -1,0 +1,155 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_GOOGLE_include_directive : require
+// The matrix product of gemm_layout.glsl for GPUs without a scalar path for
+// uniform reads: a workgroup of 256 invocations takes ROWS rows and 64
+// columns, with a block of 16 rows of the weights staged in shared memory
+// beside the input's; each invocation computes RPT rows by 8 columns.
+layout(local_size_x = 256) in;
+
+#include "gemm_layout.glsl"
+// Each input row's mean and inverse deviation, from stats.comp, for the
+// products with a layer normalisation.
+layout(std430, binding = 3) readonly restrict buffer Stats { vec2 stats[]; };
+
+// k per tile.
+const int CK = 32;
+// k summed in half floats before the sums join the float ones: precision
+// as with 16 on the BiRefNet test photos, less conversion work. The block
+// loop's bounds keep glslc from unrolling the product loop, which NVIDIA's
+// compiler unrolls better.
+const int KH = 32;
+// Rows per invocation. Four rather than eight leave the registers for more
+// warps in flight, which hide the loads' latency better.
+const int RPT = 4;
+const int ROWS = 32 * RPT;
+// The input tile, four rows to a vector: tile[k][rows / 4].
+shared f16vec4 tile[CK * ROWS / 4];
+shared f16vec2 weights[CK * 32];
+shared float mean[ROWS];
+shared float scale[ROWS];
+shared bool valid[ROWS];
+
+void main() {
+    int t = int(gl_LocalInvocationID.x);
+    // Workgroups run in bands of G row blocks across every column block, so
+    // the ones in flight share both their input rows and their weights in
+    // the L2 cache.
+    const int G = 4;
+    int blocks = int(gl_NumWorkGroups.x);
+    int columns = int(gl_NumWorkGroups.y);
+    int l = int(gl_WorkGroupID.y) * blocks + int(gl_WorkGroupID.x);
+    int band = l / (G * columns);
+    int height = min(G, blocks - band * G);
+    int within = l - band * G * columns;
+    int r0 = (band * G + within % height) * ROWS;
+    int co0 = (within / height) * 64;
+    int np = (pc.n + 63) & ~63;
+    // A warp of 32 invocations shares its 8 columns, so warps past the last
+    // column skip the products as a whole.
+    int rg = t & 31;
+    int cg = t >> 5;
+    bool computes = co0 + cg * 8 < pc.n;
+    // Each invocation loads a 4 x 4 block of each tile: values 4 kq .. 4 kq + 3
+    // of block `upper` (0 or 1) of rows 4 q .. 4 q + 3, which it writes to
+    // the tile transposed. Rows past the last, padding tokens and k past the
+    // share read zeros.
+    int q = (t >> 2) & 31;
+    int kq = t & 3;
+    int upper = t >> 7;
+    int start[4];
+    [[unroll]] for (int i = 0; i < 4; i++) {
+        int r = r0 + 4 * q + i;
+        start[i] = r < pc.rows ? row_start(pc.in_mode, r, pc.src_stride, pc.src_off) : -1;
+    }
+    if (t < ROWS)
+        valid[t] = r0 + t < pc.rows && row_start(pc.in_mode, r0 + t, pc.src_stride, pc.src_off) >= 0;
+    f16vec4 next[4];
+
+    if (pc.norm != 0 && t < ROWS) {
+        vec2 st = stats[min(r0 + t, pc.rows - 1)];
+        mean[t] = st.x;
+        scale[t] = st.y;
+    }
+
+    vec2 acc[RPT][4];
+    [[unroll]] for (int p = 0; p < RPT; p++)
+        [[unroll]] for (int j = 0; j < 4; j++)
+            acc[p][j] = vec2(0.0);
+    int k_first, k_last;
+    k_range(k_first, k_last);
+    {
+        int kh = k_first + 16 * upper;
+        Chunk ch = chunk(min(kh, k_last - 16));
+        [[unroll]] for (int i = 0; i < 4; i++)
+            next[i] = kh < k_last ? load4(start[i], ch, kq) : f16vec4(0.0);
+    }
+    for (int k0 = k_first; k0 < k_last; k0 += CK) {
+        int kh = k0 + 16 * upper;
+        barrier();
+        if (pc.norm != 0 && kh < k_last) {
+            vec4 g = vec4(pf[pc.g_off + kh + 4 * kq], pf[pc.g_off + kh + 4 * kq + 1],
+                pf[pc.g_off + kh + 4 * kq + 2], pf[pc.g_off + kh + 4 * kq + 3]);
+            vec4 b = vec4(pf[pc.beta_off + kh + 4 * kq], pf[pc.beta_off + kh + 4 * kq + 1],
+                pf[pc.beta_off + kh + 4 * kq + 2], pf[pc.beta_off + kh + 4 * kq + 3]);
+            [[unroll]] for (int i = 0; i < 4; i++) {
+                int row = 4 * q + i;
+                vec4 v = (vec4(next[i]) - mean[row]) * scale[row] * g + b;
+                next[i] = valid[row] ? f16vec4(v) : f16vec4(0.0);
+            }
+        }
+        [[unroll]] for (int j = 0; j < 4; j++)
+            tile[(16 * upper + 4 * kq + j) * (ROWS / 4) + q] = f16vec4(next[0][j], next[1][j], next[2][j], next[3][j]);
+        [[unroll]] for (int s = 0; s < 4; s++) {
+            int i = t + 256 * s;
+            int k = k0 + (i >> 5);
+            weights[i] = k < k_last ? params[((pc.w_off + k * np + co0) >> 1) + (i & 31)] : f16vec2(0.0);
+        }
+        barrier();
+        if (k0 + CK < k_last) {
+            int kn = kh + CK;
+            Chunk ch = chunk(min(kn, k_last - 16));
+            [[unroll]] for (int i = 0; i < 4; i++)
+                next[i] = kn < k_last ? load4(start[i], ch, kq) : f16vec4(0.0);
+        }
+        [[unroll]] for (int b = 0; b < CK / KH; b++) {
+            if (!computes || k0 + KH * b >= k_last)
+                break;
+            f16vec2 block[RPT][4];
+            [[unroll]] for (int p = 0; p < RPT; p++)
+                [[unroll]] for (int j = 0; j < 4; j++)
+                    block[p][j] = f16vec2(0.0);
+            [[unroll]] for (int c = KH * b; c < KH * b + KH; c++) {
+                f16vec2 w[4];
+                [[unroll]] for (int j = 0; j < 4; j++)
+                    w[j] = weights[c * 32 + cg * 4 + j];
+                [[unroll]] for (int h = 0; h < RPT / 4; h++) {
+                    f16vec4 v = tile[c * (ROWS / 4) + rg * (RPT / 4) + h];
+                    [[unroll]] for (int p = 0; p < 4; p++)
+                        [[unroll]] for (int j = 0; j < 4; j++)
+                            block[4 * h + p][j] = fma(f16vec2(v[p]), w[j], block[4 * h + p][j]);
+                }
+            }
+            [[unroll]] for (int p = 0; p < RPT; p++)
+                [[unroll]] for (int j = 0; j < 4; j++)
+                    acc[p][j] += vec2(block[p][j]);
+        }
+    }
+
+    int col0 = co0 + cg * 8;
+    if (col0 >= pc.n)
+        return;
+    [[unroll]] for (int p = 0; p < RPT; p++) {
+        int r = r0 + rg * RPT + p;
+        if (r >= pc.rows)
+            return;
+        int at = row_start(pc.out_mode, r, pc.dst_stride, pc.dst_off)
+            + int(gl_WorkGroupID.z) * pc.rows * pc.dst_stride;
+        if (at < 0 || store8(at, col0, acc[p]))
+            continue;
+        [[unroll]] for (int j = 0; j < 4 && col0 + 2 * j < pc.n; j++)
+            store(at, col0 + 2 * j, acc[p][j]);
+    }
+}
