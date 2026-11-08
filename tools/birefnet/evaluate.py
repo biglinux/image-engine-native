@@ -92,13 +92,16 @@ def prepare(args):
 def ort(args):
     import onnxruntime
 
+    paths = sorted(pathlib.Path(args.rgb_dir).glob("*.rgb"))
+    if not paths:
+        sys.exit(f"no NAME.rgb in {args.rgb_dir}")
     options = onnxruntime.SessionOptions()
     options.intra_op_num_threads = args.threads
     session = onnxruntime.InferenceSession(
         args.model, options, providers=["CPUExecutionProvider"]
     )
     name = session.get_inputs()[0].name
-    for path in sorted(pathlib.Path(args.rgb_dir).glob("*.rgb")):
+    for path in paths:
         start = time.perf_counter()
         (logits,) = session.run(None, {name: normalized_nchw(read_rgb(path))})
         elapsed = time.perf_counter() - start
