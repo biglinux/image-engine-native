@@ -133,25 +133,19 @@ fn unbounded_margin_runs_whole_image() {
     let image: Vec<f32> = (0..128 * 96 * 3)
         .map(|i| (i % 251) as f32 / 250.0)
         .collect();
+    let whole = model.run_float(&image, 128, 96).unwrap();
     // With tiles of 64, a margin of 128 already gives each tile the whole
-    // image.
-    let covered = model
-        .run_float_tiled(&image, 128, 96, 64, 128, |_| ControlFlow::Continue(()))
-        .unwrap();
-    let unbounded = model
-        .run_float_tiled(&image, 128, 96, 64, usize::MAX, |_| {
-            ControlFlow::Continue(())
-        })
-        .unwrap();
-    assert_eq!(
-        unbounded.len(),
-        covered.len(),
-        "size with an unbounded margin"
-    );
-    let differ = unbounded
-        .iter()
-        .zip(&covered)
-        .filter(|(u, c)| u.to_bits() != c.to_bits())
-        .count();
-    assert_eq!(differ, 0, "values that differ with an unbounded margin");
+    // image, and an unbounded one must too.
+    for margin in [128, usize::MAX] {
+        let tiled = model
+            .run_float_tiled(&image, 128, 96, 64, margin, |_| ControlFlow::Continue(()))
+            .unwrap();
+        assert_eq!(tiled.len(), whole.len(), "size with margin {margin}");
+        let differ = tiled
+            .iter()
+            .zip(&whole)
+            .filter(|(t, w)| t.to_bits() != w.to_bits())
+            .count();
+        assert_eq!(differ, 0, "values off the whole image with margin {margin}");
+    }
 }
