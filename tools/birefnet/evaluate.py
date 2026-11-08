@@ -73,8 +73,14 @@ def prepare(args):
         other = photos.setdefault(path.stem.casefold(), path)
         if other != path:
             sys.exit(f"{path.name} and {other.name} would write the same files")
+    if not photos:
+        sys.exit(f"no photo in {args.images}")
     for path in photos.values():
-        image = Image.open(path).convert("RGB")
+        try:
+            image = Image.open(path).convert("RGB")
+        except OSError as e:
+            print(f"{path.name}: {e}, skipped", file=sys.stderr)
+            continue
         image = image.resize((args.side, args.side), Image.LANCZOS)
         np.asarray(image, dtype=np.uint8).tofile(out / f"{path.stem}.rgb")
         print(path.stem)

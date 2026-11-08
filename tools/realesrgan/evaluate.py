@@ -43,8 +43,14 @@ def prepare(args):
         other = photos.setdefault(path.stem.casefold(), path)
         if other != path:
             sys.exit(f"{path.name} and {other.name} would write the same files")
+    if not photos:
+        sys.exit(f"no photo in {args.img_dir}")
     for path in photos.values():
-        image = Image.open(path).convert("RGB")
+        try:
+            image = Image.open(path).convert("RGB")
+        except OSError as e:
+            print(f"skipped {path.name}: {e}", file=sys.stderr)
+            continue
         w, h = image.size
         scale = min(w / big[0], h / big[1])
         cw, ch = big[0] * scale, big[1] * scale
