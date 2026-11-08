@@ -47,10 +47,10 @@ struct Device {
     handle: Handle,
     d: ffi::device::Functions,
     memory: ffi::MemoryProperties,
-    /// Set once the device may still be running work that a failed wait left
-    /// behind. From then on nothing is submitted, no host buffer is read or
-    /// written, an object is destroyed only once the device is idle, and the
-    /// device and its instance are leaked.
+    /// Set once a failed wait may have left work running. From then on
+    /// nothing is submitted, no host buffer is read or written, and every
+    /// object made from the device is leaked with the device and its
+    /// instance, without waiting again.
     busy: AtomicBool,
     /// Destroyed after the device.
     instance: ManuallyDrop<Instance>,
@@ -65,7 +65,7 @@ unsafe impl Sync for Device {}
 
 impl Drop for Device {
     fn drop(&mut self) {
-        if !self.idle() || self.busy.load(Ordering::Acquire) {
+        if self.busy.load(Ordering::Acquire) || !self.idle() {
             return;
         }
         // SAFETY: every object made from the device is gone, since each holds
@@ -89,9 +89,12 @@ impl Device {
     }
 
     /// Whether an object made from the device may be destroyed: once the
-    /// device is idle. Otherwise the object is to be leaked, and so is the
-    /// device.
+    /// device is idle, unless it is busy. Otherwise the object is to be
+    /// leaked, and so is the device.
     fn release(&self) -> bool {
+        if self.busy.load(Ordering::Acquire) {
+            return false;
+        }
         let idle = self.idle();
         if !idle {
             self.busy.store(true, Ordering::Release);
@@ -128,6 +131,9 @@ pub struct Gpu {
     groups: [u32; 3],
     /// Bytes a storage buffer may span in a shader.
     storage_range: u32,
+    /// Set when a fence failed to reset: still signalled, it must not go with
+    /// another submission, so none is made.
+    unreset_fence: bool,
 }
 
 // SAFETY: `Gpu` is not `Sync`, so every reference to it, and to the queue,
@@ -190,6 +196,7 @@ impl Gpu {
             shared_memory: limits.max_compute_shared_memory_size,
             groups: limits.max_compute_work_group_count,
             storage_range: limits.max_storage_buffer_range,
+            unreset_fence: false,
         };
         let (d, h) = (&gpu.dev.d, gpu.dev.handle);
         // SAFETY: the device is valid and each create-info lives across its
@@ -430,7 +437,7 @@ impl Gpu {
 
     /// Wait for slot `slot`'s submission, then make its fence and descriptor
     /// sets reusable.
-    fn wait(&self, slot: usize) -> Result<(), String> {
+    fn wait(&mut self, slot: usize) -> Result<(), String> {
         let (d, h) = (&self.dev.d, self.dev.handle);
         // SAFETY: the fence belongs to the device and went with the slot's
         // submission.
@@ -447,14 +454,18 @@ impl Gpu {
         let reset = check("resetting a fence", unsafe {
             (d.reset_fences)(h, 1, &self.fence[slot])
         });
+        self.unreset_fence |= reset.is_err();
         waited.and(reset).and(self.reset(slot))
     }
 
-    /// An error once a failed wait has left work running on the GPU: it then
-    /// takes no more submissions, and its host buffers are not to be touched.
+    /// An error once a failed wait has left work running on the GPU, whose
+    /// host buffers are then not to be touched, or a fence failed to reset;
+    /// either way the GPU takes no more submissions.
     pub fn usable(&self) -> Result<(), String> {
         if self.dev.busy.load(Ordering::Acquire) {
-            Err("an earlier submission may still be running".into())
+            Err("the GPU may still be running work after a failed wait".into())
+        } else if self.unreset_fence {
+            Err("a fence of the GPU failed to reset".into())
         } else {
             Ok(())
         }
