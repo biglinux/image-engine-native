@@ -1,0 +1,86 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// 3x3 convolution to 64 channels in half floats, NHWC, plus bias and an
+// optional PReLU. One wave of 64 lanes covers an 8 x 8 tile, one pixel per
+// lane, two output channels per packed multiply-add. The weights' index is
+// the same in every lane, so AMD GPUs read them through the scalar cache into
+// scalar registers and leave LDS to the input.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly restrict buffer Src { float16_t src[]; };
+layout(std430, binding = 0) readonly restrict buffer Src4 { f16vec4 src4[]; };
+layout(std430, binding = 1) writeonly restrict buffer Dst { f16vec2 dst[]; };
+// [tap][cin][64] weights, then each layer's bias and PReLU slopes.
+layout(std430, binding = 2) readonly restrict buffer Params { f16vec2 params[]; };
+layout(push_constant) uniform PC {
+    int W; int H; int cin; int w_off; int b_off; int s_off;
+} pc;
+
+const int CK = 16;
+const int SW = 10;
+shared float16_t tile[CK * SW * SW];
+
+void main() {
+    int t = int(gl_LocalInvocationID.x);
+    int lx = t % 8;
+    int ly = t / 8;
+    int x0 = int(gl_WorkGroupID.x) * 8;
+    int y0 = int(gl_WorkGroupID.y) * 8;
+    f16vec2 acc[32];
+    [[unroll]] for (int j = 0; j < 32; j++)
+        acc[j] = f16vec2(0.0);
+    for (int c0 = 0; c0 < pc.cin; c0 += CK) {
+        int ck = min(CK, pc.cin - c0);
+        if ((pc.cin & 3) == 0) {
+            // Four channels of a pixel per load.
+            for (int i = t; i < SW * SW * CK / 4; i += 64) {
+                int c = 4 * (i % (CK / 4));
+                int q = i / (CK / 4);
+                int y = y0 + q / SW - 1;
+                int x = x0 + q % SW - 1;
+                f16vec4 v = f16vec4(0.0);
+                if (c < ck && y >= 0 && y < pc.H && x >= 0 && x < pc.W)
+                    v = src4[((y * pc.W + x) * pc.cin + c0 + c) >> 2];
+                [[unroll]] for (int j = 0; j < 4; j++)
+                    tile[((c + j) * SW + q / SW) * SW + q % SW] = v[j];
+            }
+        } else {
+            for (int i = t; i < SW * SW * CK; i += 64) {
+                int c = i % CK;
+                int q = i / CK;
+                int y = y0 + q / SW - 1;
+                int x = x0 + q % SW - 1;
+                float16_t v = float16_t(0.0);
+                if (c < ck && y >= 0 && y < pc.H && x >= 0 && x < pc.W)
+                    v = src[(y * pc.W + x) * pc.cin + c0 + c];
+                tile[(c * SW + q / SW) * SW + q % SW] = v;
+            }
+        }
+        barrier();
+        for (int c = 0; c < ck; c++) {
+            [[unroll]] for (int tap = 0; tap < 9; tap++) {
+                int wb = (pc.w_off + (tap * pc.cin + c0 + c) * 64) >> 1;
+                f16vec2 w[32];
+                [[unroll]] for (int j = 0; j < 32; j++)
+                    w[j] = params[wb + j];
+                f16vec2 v = f16vec2(tile[(c * SW + ly + tap / 3) * SW + lx + tap % 3]);
+                [[unroll]] for (int j = 0; j < 32; j++)
+                    acc[j] = fma(v, w[j], acc[j]);
+            }
+        }
+        barrier();
+    }
+    int x = x0 + lx;
+    int y = y0 + ly;
+    if (x >= pc.W || y >= pc.H)
+        return;
+    [[unroll]] for (int j = 0; j < 32; j++) {
+        f16vec2 v = acc[j] + params[(pc.b_off >> 1) + j];
+        if (pc.s_off >= 0) {
+            f16vec2 s = params[(pc.s_off >> 1) + j];
+            v = mix(v, v * s, lessThan(v, f16vec2(0.0)));
+        }
+        dst[(y * pc.W + x) * 32 + j] = v;
+    }
+}

@@ -1,0 +1,27 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Pixel shuffle of the last layer's channels plus the input repeated: output
+// pixel (4y + i, 4x + j) has channel c from input pixel (y, x)'s channel
+// 16c + 4i + j, plus that pixel's own channel c. The last layer's 48
+// channels are stored 64 apart. The output is in half floats.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly restrict buffer Last { float16_t last[]; };
+layout(std430, binding = 1) readonly restrict buffer Image { float16_t image[]; };
+layout(std430, binding = 2) writeonly restrict buffer Dst { float16_t dst[]; };
+layout(push_constant) uniform PC {
+    int W; int H; int cin; int w_off; int b_off; int s_off;
+} pc;
+
+void main() {
+    int id = int(gl_GlobalInvocationID.x);
+    int ow = pc.W * 4;
+    if (id >= ow * pc.H * 4)
+        return;
+    int oy = id / ow;
+    int ox = id % ow;
+    int p = (oy / 4) * pc.W + ox / 4;
+    int ij = (oy % 4) * 4 + ox % 4;
+    for (int c = 0; c < 3; c++)
+        dst[id * 3 + c] = last[p * 64 + c * 16 + ij] + image[p * 3 + c];
+}

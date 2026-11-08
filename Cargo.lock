@@ -19,6 +19,14 @@ name = "native-vulkan"
 version = "0.1.0"
 
 [[package]]
+name = "realesrgan-native"
+version = "0.1.0"
+dependencies = [
+ "native-engine",
+ "native-vulkan",
+]
+
+[[package]]
 name = "scunet-native"
 version = "0.1.0"
 dependencies = [

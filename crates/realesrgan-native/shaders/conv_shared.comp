@@ -1,0 +1,121 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// 3x3 convolution to 64 channels in half floats, NHWC, plus bias and an
+// optional PReLU, with the weights of each block of CK input channels staged
+// in shared memory. A workgroup covers 8 x TY pixels; each invocation PX
+// pixels of a row for 8 channels, 8 / PX invocations sharing the row. Each
+// input row of 10 pixels is read once for the 3 kernel columns, and rows are
+// padded to 12 to keep vector reads aligned. Needs 256 invocations and up to
+// 31.5 KB of shared memory. PX 4 keeps Intel GPUs out of register spills.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly restrict buffer Src { float16_t src[]; };
+layout(std430, binding = 0) readonly restrict buffer Src4 { f16vec4 src4[]; };
+layout(std430, binding = 1) writeonly restrict buffer Dst { uvec4 dst16[]; };
+// [tap][cin][64] weights, then each layer's bias and PReLU slopes.
+layout(std430, binding = 2) readonly restrict buffer Params { f16vec2 params[]; };
+layout(std430, binding = 2) readonly restrict buffer Params4 { uvec4 params4[]; };
+layout(push_constant) uniform PC {
+    int W; int H; int cin; int w_off; int b_off; int s_off;
+} pc;
+
+#ifndef PX
+#define PX 8
+#endif
+const int TY = 256 / (8 * (8 / PX));
+const int CK = 16;
+const int SW = 12;
+shared float16_t tile_in[CK * (TY + 2) * SW];
+// Four column pairs to a vector: every array starts at a multiple of 64.
+shared uvec4 tile_w[9 * CK * 8];
+
+void main() {
+    int t = int(gl_LocalInvocationID.x);
+    int x0 = int(gl_WorkGroupID.x) * 8;
+    int y0 = int(gl_WorkGroupID.y) * TY;
+    int cg = t % 8;
+    int part = (t / 8) % (8 / PX);
+    int row = t / (8 * (8 / PX));
+    f16vec2 acc[PX][4];
+    [[unroll]] for (int p = 0; p < PX; p++)
+        [[unroll]] for (int j = 0; j < 4; j++)
+            acc[p][j] = f16vec2(0.0);
+    for (int c0 = 0; c0 < pc.cin; c0 += CK) {
+        int ck = min(CK, pc.cin - c0);
+        if ((pc.cin & 3) == 0) {
+            // Four channels of a pixel per load.
+            for (int i = t; i < (TY + 2) * 10 * CK / 4; i += 256) {
+                int c = 4 * (i % (CK / 4));
+                int q = i / (CK / 4);
+                int y = y0 + q / 10 - 1;
+                int x = x0 + q % 10 - 1;
+                f16vec4 v = f16vec4(0.0);
+                if (c < ck && y >= 0 && y < pc.H && x >= 0 && x < pc.W)
+                    v = src4[((y * pc.W + x) * pc.cin + c0 + c) >> 2];
+                [[unroll]] for (int e = 0; e < 4; e++)
+                    tile_in[((c + e) * (TY + 2) + q / 10) * SW + q % 10] = v[e];
+            }
+        } else {
+            for (int i = t; i < (TY + 2) * 10 * CK; i += 256) {
+                int c = i % CK;
+                int q = i / CK;
+                int y = y0 + q / 10 - 1;
+                int x = x0 + q % 10 - 1;
+                float16_t v = float16_t(0.0);
+                if (c < ck && y >= 0 && y < pc.H && x >= 0 && x < pc.W)
+                    v = src[(y * pc.W + x) * pc.cin + c0 + c];
+                tile_in[(c * (TY + 2) + q / 10) * SW + q % 10] = v;
+            }
+        }
+        for (int i = t; i < 9 * CK * 8; i += 256) {
+            int o = i % 8;
+            int r = i / 8;
+            int c = r % CK;
+            int tap = r / CK;
+            uvec4 v = uvec4(0);
+            if (c < ck)
+                v = params4[((pc.w_off + (tap * pc.cin + c0 + c) * 64) >> 3) + o];
+            tile_w[i] = v;
+        }
+        barrier();
+        for (int c = 0; c < ck; c++) {
+            [[unroll]] for (int ky = 0; ky < 3; ky++) {
+                float16_t v[PX + 2];
+                int ib = (c * (TY + 2) + row + ky) * SW + part * PX;
+                [[unroll]] for (int k = 0; k < PX + 2; k++)
+                    v[k] = tile_in[ib + k];
+                [[unroll]] for (int kx = 0; kx < 3; kx++) {
+                    uvec4 wq = tile_w[((ky * 3 + kx) * CK + c) * 8 + cg];
+                    f16vec2 w[4];
+                    [[unroll]] for (int j = 0; j < 4; j++)
+                        w[j] = unpackFloat2x16(wq[j]);
+                    [[unroll]] for (int p = 0; p < PX; p++)
+                        [[unroll]] for (int j = 0; j < 4; j++)
+                            acc[p][j] = fma(f16vec2(v[p + kx]), w[j], acc[p][j]);
+                }
+            }
+        }
+        barrier();
+    }
+    int y = y0 + row;
+    if (y >= pc.H)
+        return;
+    [[unroll]] for (int p = 0; p < PX; p++) {
+        int x = x0 + part * PX + p;
+        if (x >= pc.W)
+            continue;
+        // The invocation's 8 channels go out in one 16-byte write.
+        uvec4 w;
+        [[unroll]] for (int j = 0; j < 4; j++) {
+            int k = cg * 4 + j;
+            f16vec2 v = acc[p][j] + params[(pc.b_off >> 1) + k];
+            if (pc.s_off >= 0) {
+                f16vec2 s = params[(pc.s_off >> 1) + k];
+                v = mix(v, v * s, lessThan(v, f16vec2(0.0)));
+            }
+            w[j] = packFloat2x16(v);
+        }
+        dst16[(y * pc.W + x) * 8 + cg] = w;
+    }
+}
