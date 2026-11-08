@@ -1,0 +1,5 @@
+/target
+# Weights are exported from each model's published files and keep their
+# licences; see "Build" in each crate's README.md.
+/weights
+__pycache__/
