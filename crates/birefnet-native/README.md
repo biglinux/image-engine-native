@@ -253,7 +253,7 @@ BIREFNET_NATIVE_WEIGHTS=weights/birefnet-lite.weights BIREFNET_NATIVE_REFERENCE=
 ```
 
 The ignored `gpu` test needs a GPU and checks it against the CPU engine on
-the same photos: IoU above 0.94 and fewer than 2.5 % of the pixels more than
+the same photos: IoU above 0.9 and fewer than 2.5 % of the pixels more than
 25 steps away on each, mean IoU above 0.995, and the typical photo's
 opacities moved by under 0.02 steps on average (0.004 measured).
 

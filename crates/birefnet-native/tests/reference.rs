@@ -41,7 +41,19 @@ fn matches_pytorch_reference() {
             .collect();
         let rgb = std::fs::read(&path).unwrap();
         let side = (want.len() as f64).sqrt() as usize;
+        assert_eq!(
+            side * side,
+            want.len(),
+            "{}: reference size",
+            reference.display()
+        );
         let got = model.run(&rgb, side).unwrap();
+        assert_eq!(got.len(), want.len(), "{}: output size", path.display());
+        assert!(
+            got.iter().chain(&want).all(|v| v.is_finite()),
+            "{}: logits not finite",
+            path.display()
+        );
         // A float32 run of the same network: logits within 0.01, and no 8-bit
         // opacity more than one step away.
         let worst_logit = got
