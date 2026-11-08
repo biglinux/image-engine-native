@@ -19,8 +19,8 @@ pub(crate) struct Instance {
 
 impl Drop for Instance {
     fn drop(&mut self) {
-        // SAFETY: the device made from it, if any, is already destroyed: it
-        // is owned by the `Device` holding this instance, dropped first.
+        // SAFETY: the device made from it, if any, is already destroyed: the
+        // `Device` holding this instance drops it only after that.
         unsafe { (self.i.destroy_instance)(self.handle, null()) };
     }
 }

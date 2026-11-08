@@ -11,8 +11,10 @@
 mod ffi;
 mod open;
 
+use std::mem::ManuallyDrop;
 use std::ptr::{null, null_mut};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ffi::{Handle, Object};
 use open::{Instance, choose, create_device, create_instance, device_name};
@@ -45,8 +47,11 @@ struct Device {
     handle: Handle,
     d: ffi::device::Functions,
     memory: ffi::MemoryProperties,
-    // Dropped after the device, by field order.
-    _instance: Instance,
+    /// Set when an object made from the device was leaked because the device
+    /// could still be using it; the device and instance are then leaked too.
+    leaked: AtomicBool,
+    /// Destroyed after the device.
+    instance: ManuallyDrop<Instance>,
 }
 
 // SAFETY: the handles are identifiers the driver lets any thread use; the
@@ -58,16 +63,40 @@ unsafe impl Sync for Device {}
 
 impl Drop for Device {
     fn drop(&mut self) {
+        if !self.idle() || self.leaked.load(Ordering::Relaxed) {
+            return;
+        }
         // SAFETY: every object made from the device is gone, since each holds
-        // an Arc of it, and the device is idle once vkDeviceWaitIdle returns.
+        // an Arc of it and none was leaked, and the device is idle; the
+        // instance is dropped once, after it.
         unsafe {
-            (self.d.device_wait_idle)(self.handle);
             (self.d.destroy_device)(self.handle, null());
+            ManuallyDrop::drop(&mut self.instance);
         }
     }
 }
 
 impl Device {
+    /// Wait until the device runs nothing. False when that is unknown, as
+    /// when the wait runs out of memory.
+    fn idle(&self) -> bool {
+        // SAFETY: the device is valid.
+        let result = unsafe { (self.d.device_wait_idle)(self.handle) };
+        // A lost device runs nothing more.
+        matches!(result, ffi::SUCCESS | ffi::ERROR_DEVICE_LOST)
+    }
+
+    /// Whether an object made from the device may be destroyed: once the
+    /// device is idle. Otherwise the object is to be leaked, and so is the
+    /// device.
+    fn release(&self) -> bool {
+        let idle = self.idle();
+        if !idle {
+            self.leaked.store(true, Ordering::Relaxed);
+        }
+        idle
+    }
+
     /// The first memory type in `bits` with all of `flags`, trying each set
     /// of flags in turn.
     fn memory_type(&self, bits: u32, flags: &[u32]) -> Option<u32> {
@@ -97,6 +126,9 @@ pub struct Gpu {
     groups: [u32; 3],
     /// Bytes a storage buffer may span in a shader.
     storage_range: u32,
+    /// Set when a submission may still run after its waits failed; nothing
+    /// is submitted again, so that its objects are never reused.
+    stuck: bool,
 }
 
 // SAFETY: `Gpu` is not `Sync`, so every reference to it, and to the queue,
@@ -106,8 +138,11 @@ unsafe impl Send for Gpu {}
 
 impl Drop for Gpu {
     fn drop(&mut self) {
-        // SAFETY: `run` and `Steps` wait for each submission, so nothing is
-        // pending; destroying a null handle does nothing.
+        if !self.dev.release() {
+            return;
+        }
+        // SAFETY: the device is idle, so no submission uses the fences, pools
+        // or command buffers; destroying a null handle does nothing.
         unsafe {
             let d = &self.dev.d;
             for slot in 0..2 {
@@ -140,7 +175,8 @@ impl Gpu {
             handle,
             d,
             memory,
-            _instance: instance,
+            leaked: AtomicBool::new(false),
+            instance: ManuallyDrop::new(instance),
         });
         let limits = &choice.props.limits;
         let mut gpu = Self {
@@ -155,6 +191,7 @@ impl Gpu {
             shared_memory: limits.max_compute_shared_memory_size,
             groups: limits.max_compute_work_group_count,
             storage_range: limits.max_storage_buffer_range,
+            stuck: false,
         };
         let (d, h) = (&gpu.dev.d, gpu.dev.handle);
         // SAFETY: the device is valid and each create-info lives across its
@@ -297,6 +334,7 @@ impl Gpu {
         &mut self,
         mut record: impl FnMut(&mut Commands<'_>) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.usable()?;
         match self.record(0, &mut record).and_then(|()| self.submit(0)) {
             Ok(()) => self.wait(0),
             Err(e) => self.reset(0).and(Err(e)),
@@ -393,26 +431,33 @@ impl Gpu {
 
     /// Wait for slot `slot`'s submission, then make its fence and descriptor
     /// sets reusable.
-    fn wait(&self, slot: usize) -> Result<(), String> {
+    fn wait(&mut self, slot: usize) -> Result<(), String> {
         let (d, h) = (&self.dev.d, self.dev.handle);
         // SAFETY: the fence belongs to the device and went with the slot's
         // submission.
         let waited = check("waiting for the GPU", unsafe {
             (d.wait_for_fences)(h, 1, &self.fence[slot], 1, u64::MAX)
         });
-        if waited.is_err() {
-            // SAFETY: the device is valid. A failed fence wait may leave the
-            // submission running, and nothing below may reset its objects
-            // until the device is idle.
-            if check("waiting for the GPU", unsafe { (d.device_wait_idle)(h) }).is_err() {
-                return waited;
-            }
+        // A failed fence wait may leave the submission running, and nothing
+        // below may reset its objects until the device is idle.
+        if waited.is_err() && !self.dev.idle() {
+            self.stuck = true;
+            return waited;
         }
         // SAFETY: the submission has finished.
         let reset = check("resetting a fence", unsafe {
             (d.reset_fences)(h, 1, &self.fence[slot])
         });
         waited.and(reset).and(self.reset(slot))
+    }
+
+    /// Refuse to record while a submission may still run (see `stuck`).
+    fn usable(&self) -> Result<(), String> {
+        if self.stuck {
+            Err("an earlier submission may still be running".into())
+        } else {
+            Ok(())
+        }
     }
 
     /// Free slot `slot`'s descriptor sets, whose submission has finished or
@@ -473,6 +518,7 @@ impl Steps<'_> {
         &mut self,
         mut record: impl FnMut(&mut Commands<'_>) -> Result<(), String>,
     ) -> Result<bool, String> {
+        self.gpu.usable()?;
         let slot = self.next;
         if let Err(e) = self
             .gpu
@@ -499,8 +545,8 @@ impl Steps<'_> {
 
 impl Drop for Steps<'_> {
     fn drop(&mut self) {
-        // Its objects must not be reused while it runs. An error here means
-        // a lost device, which every later call reports.
+        // Its objects must not be reused while it runs; after a failed wait
+        // that leaves the device busy they never are (see `Gpu::wait`).
         if let Some(slot) = self.pending.take() {
             let _ = self.gpu.wait(slot);
         }
@@ -704,11 +750,14 @@ unsafe impl Send for Buffer {}
 
 impl Drop for Buffer {
     fn drop(&mut self) {
-        // SAFETY: once the device is idle no submission uses the buffer (a
-        // `Steps` submission may still be running when the borrow that
-        // recorded it ends), and freeing the memory unmaps it.
+        // A `Steps` submission may still be running when the borrow that
+        // recorded it ends.
+        if !self.dev.release() {
+            return;
+        }
+        // SAFETY: the device is idle, so no submission uses the buffer, and
+        // freeing the memory unmaps it.
         unsafe {
-            (self.dev.d.device_wait_idle)(self.dev.handle);
             (self.dev.d.destroy_buffer)(self.dev.handle, self.buffer, null());
             (self.dev.d.free_memory)(self.dev.handle, self.memory, null());
         }
@@ -815,11 +864,13 @@ pub struct Kernel {
 
 impl Drop for Kernel {
     fn drop(&mut self) {
-        // SAFETY: once the device is idle no submission uses the kernel, as
-        // for a buffer; null handles are no-ops.
+        if !self.dev.release() {
+            return;
+        }
+        // SAFETY: the device is idle, so no submission uses the kernel; null
+        // handles are no-ops.
         unsafe {
             let (d, h) = (&self.dev.d, self.dev.handle);
-            (d.device_wait_idle)(h);
             (d.destroy_pipeline)(h, self.pipeline, null());
             (d.destroy_pipeline_layout)(h, self.layout, null());
             (d.destroy_set_layout)(h, self.set_layout, null());
