@@ -263,7 +263,10 @@ impl Model {
             for i in 0..cols {
                 let (x0, x1) = (i * width / cols, (i + 1) * width / cols);
                 let (rx0, ry0) = (x0.saturating_sub(margin), y0.saturating_sub(margin));
-                let (rx1, ry1) = ((x1 + margin).min(width), (y1 + margin).min(height));
+                let (rx1, ry1) = (
+                    x1.saturating_add(margin).min(width),
+                    y1.saturating_add(margin).min(height),
+                );
                 let rw = rx1 - rx0;
                 region.clear();
                 for y in ry0..ry1 {
