@@ -125,7 +125,8 @@ impl Pool {
     }
 
     /// Run `task(items, scratch)` over consecutive ranges that cover
-    /// `0..items`, in multiples of `grain` and at most `max` long. Each thread
+    /// `0..items`, in multiples of `grain` and at most `max` long, `max`
+    /// rounded down to a multiple of `grain` but no less than one. Each thread
     /// takes the next range as it finishes one, sized to share what is left
     /// (guided scheduling): long ranges while there is much to do, short ones
     /// at the end, so threads finish together instead of waiting on the last

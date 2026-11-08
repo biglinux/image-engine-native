@@ -95,8 +95,8 @@ impl Model {
         }
     }
 
-    /// [`Model::load`] on the CPU only, whose results match the original
-    /// model's to 1.3e-6.
+    /// [`Model::load`] on the CPU only. Its distance from the original model,
+    /// with float and with half-float weights, is in the README.
     pub fn load_cpu(path: &Path, threads: usize) -> Result<Self, Error> {
         let mut file = weight_file::WeightFile::read(path, b"SCUNET\0\0")?;
         let network = network::Network::load(&mut file)?;
