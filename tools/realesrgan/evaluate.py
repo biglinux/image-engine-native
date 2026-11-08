@@ -31,12 +31,16 @@ def prepare(args):
     out = pathlib.Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
     big = (args.width * SCALE, args.height * SCALE)
+    names = set()
     for path in sorted(pathlib.Path(args.img_dir).iterdir()):
         try:
             image = Image.open(path).convert("RGB")
         except OSError:
             print(f"skipped {path.name}: not an image", file=sys.stderr)
             continue
+        if path.stem in names:
+            sys.exit(f"{path.name}: another photo is also named {path.stem}")
+        names.add(path.stem)
         w, h = image.size
         scale = min(w / big[0], h / big[1])
         cw, ch = big[0] * scale, big[1] * scale
@@ -63,7 +67,10 @@ def compare(args):
     big = (args.width * SCALE, args.height * SCALE)
     shape = (big[1], big[0], 3)
     worst, mean, differ, total = 0.0, [], 0, 0
-    for path in sorted(pathlib.Path(args.dir).glob("*.rgb")):
+    paths = sorted(pathlib.Path(args.dir).glob("*.rgb"))
+    if not paths:
+        sys.exit(f"no NAME.rgb in {args.dir}")
+    for path in paths:
         clean = np.fromfile(path.with_suffix(".clean"), np.uint8).reshape(shape)
         small = np.fromfile(path, np.uint8).reshape(small_shape)
         lanczos = np.asarray(Image.fromarray(small).resize(big, Image.LANCZOS))

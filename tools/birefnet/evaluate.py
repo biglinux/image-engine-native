@@ -61,12 +61,16 @@ def prepare(args):
 
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    names = set()
     for path in sorted(pathlib.Path(args.images).iterdir()):
         try:
             image = Image.open(path).convert("RGB")
         except OSError:
             print(f"{path.name}: not an image, skipped", file=sys.stderr)
             continue
+        if path.stem in names:
+            sys.exit(f"{path.name}: another photo is also named {path.stem}")
+        names.add(path.stem)
         image = image.resize((args.side, args.side), Image.LANCZOS)
         np.asarray(image, dtype=np.uint8).tofile(out / f"{path.stem}.rgb")
         print(path.stem)

@@ -51,12 +51,16 @@ def holes(name, width, height):
 def prepare(args):
     out = pathlib.Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    names = set()
     for path in sorted(pathlib.Path(args.img_dir).iterdir()):
         try:
             image = Image.open(path).convert("RGB")
         except OSError:
             print(f"skipped {path.name}: not an image", file=sys.stderr)
             continue
+        if path.stem in names:
+            sys.exit(f"{path.name}: another photo is also named {path.stem}")
+        names.add(path.stem)
         w, h = image.size
         scale = min(w / args.width, h / args.height)
         cw, ch = args.width * scale, args.height * scale
@@ -81,7 +85,10 @@ def to_8bit(out):
 def compare(args):
     shape = (args.height, args.width, 3)
     worst, mean, differ, total = 0.0, [], 0, 0
-    for path in sorted(pathlib.Path(args.dir).glob("*.rgb")):
+    paths = sorted(pathlib.Path(args.dir).glob("*.rgb"))
+    if not paths:
+        sys.exit(f"no NAME.rgb in {args.dir}")
+    for path in paths:
         photo = np.fromfile(path, np.uint8).reshape(shape)
         hole = np.fromfile(path.with_suffix(".mask"), np.uint8).reshape(shape[:2]) > 0
         out = np.fromfile(path.with_suffix(f".{args.tag}.out"), "<f4").reshape(shape)
