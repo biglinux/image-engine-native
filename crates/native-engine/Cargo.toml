@@ -1,0 +1,16 @@
+[package]
+name = "native-engine"
+description = "The CPU inference core the image-engine-native models share: matrix products, threads, weights files"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "MIT AND BSD-3-Clause"
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

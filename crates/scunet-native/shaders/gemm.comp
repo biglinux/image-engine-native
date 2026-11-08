@@ -1,0 +1,173 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_ballot : require
+#extension GL_GOOGLE_include_directive : require
+#ifndef WAVES
+#define WAVES 1
+#endif
+// out[r][col] (=, +=) act(sum_k in[r][k] * W[k][col] + bias[col]) in half
+// floats, for the 1x1 convolutions and linear layers, optionally on the
+// layer-normalised input rows. A workgroup takes 64 rows and WAVES blocks of
+// 64 columns, one per wave of 64 lanes, which share each tile of the input:
+// a lane computes one row. The weights' index is the same in every lane of a
+// wave, so AMD GPUs read them through the scalar cache. W is stored
+// [k][n padded to 64], so a block of columns past n reads zeros. k is a
+// multiple of 16.
+//
+// Rows map onto the buffers in one of these ways:
+// - input mode 0: row r is `r * src_stride + src_off`; mode 1 (the 2x2
+//   stride-2 convolution): row r is output pixel (y, x) of a map `width`
+//   wide, and k runs over its four input pixels' channels; mode 2: row
+//   `base + r` is token i of 8 x 8 window w, rolled by `shift`, of a map
+//   `width` x `height`, at `src_off` within its pixel;
+// - output mode 0: row r is `r * dst_stride + dst_off`; mode 1 (the 2x2
+//   transposed convolution): column q * n/4 + ch goes to channel ch of
+//   output pixel (2y + q/2, 2x + q%2); mode 2: as input mode 2.
+layout(local_size_x = 64 * WAVES) in;
+#include "gemm_layout.glsl"
+
+const int CK = 16;
+shared float16_t tile[CK * 64];
+shared float mean[64];
+// A wave's raw sums of eight rows, on their way out.
+shared f16vec2 staged[WAVES][8][32];
+shared float scale[64];
+
+void main() {
+    int id = int(gl_LocalInvocationID.x);
+    int t = id & 63;
+    // Uniform in each wave of 64 lanes or fewer; the broadcast lets the
+    // compiler see it.
+    int wave = subgroupBroadcastFirst(id >> 6);
+    int r0 = int(gl_WorkGroupID.x) * 64;
+    int co0 = (int(gl_WorkGroupID.y) * WAVES + wave) * 64;
+    int np = (pc.n + 63) & ~63;
+    // Each tile (64 rows by 16) is loaded by the first 64 invocations, or
+    // the first 128 with more waves, in blocks of four values of their own
+    // row t: blocks NQ h .. NQ h + NQ - 1, h being id / 64, so that a
+    // wave's lanes write neighbouring rows to the tile.
+    const int NQ = WAVES == 1 ? 4 : 2;
+    bool loads = id < 256 / NQ;
+    int h = id >> 6;
+    int start = row_start(pc.in_mode, r0 + t, pc.src_stride, pc.src_off);
+
+    // Where the chunk at k0 lies relative to a row's start: in mode 1 the
+    // 16 values lie within one of the four input pixels, as k / 4 is a
+    // multiple of 16.
+    int quarter = pc.k >> 2;
+#define OFFSET(k0) (pc.in_mode == 1 \
+    ? ((((k0) / quarter) >> 1) * 2 * pc.width + (((k0) / quarter) & 1)) * pc.src_stride \
+        + (k0) - ((k0) / quarter) * quarter \
+    : (k0))
+#define LOAD(k0) [[unroll]] for (int v = 0; v < NQ; v++) \
+        next[v] = loads ? src4[((start + OFFSET(k0)) >> 2) + NQ * h + v] : f16vec4(0.0)
+    f16vec4 next[NQ];
+
+    if (pc.norm != 0) {
+        // Each lane sums its own row, a chunk at a time through `tile`.
+        float sum = 0.0;
+        float squares = 0.0;
+        for (int k0 = 0; k0 < pc.k; k0 += CK) {
+            LOAD(k0);
+            barrier();
+            if (loads)
+                [[unroll]] for (int j = 0; j < 4 * NQ; j++)
+                    tile[(4 * NQ * h + j) * 64 + t] = next[j >> 2][j & 3];
+            barrier();
+            [[unroll]] for (int c = 0; c < CK; c++) {
+                float v = float(tile[c * 64 + t]);
+                sum += v;
+                squares = fma(v, v, squares);
+            }
+        }
+        float m = sum / float(pc.k);
+        if (wave == 0) {
+            mean[t] = m;
+            scale[t] = inversesqrt(max(squares / float(pc.k) - m * m, 0.0) + 1e-5);
+        }
+    }
+
+    f16vec2 acc[32];
+    [[unroll]] for (int j = 0; j < 32; j++)
+        acc[j] = f16vec2(0.0);
+    LOAD(0);
+    for (int k0 = 0; k0 < pc.k; k0 += CK) {
+        barrier();
+        if (loads) {
+            [[unroll]] for (int j = 0; j < 4 * NQ; j++) {
+                int kk = 4 * NQ * h + j;
+                float16_t v = next[j >> 2][j & 3];
+                if (pc.norm != 0)
+                    v = float16_t((float(v) - mean[t]) * scale[t] * float(ps[pc.g_off + k0 + kk])
+                        + float(ps[pc.beta_off + k0 + kk]));
+                tile[kk * 64 + t] = v;
+            }
+        }
+        barrier();
+        // The next chunk's loads are in flight during this one's products.
+        if (k0 + CK < pc.k)
+            LOAD(k0 + CK);
+        if (co0 >= pc.n)
+            continue;
+        [[unroll]] for (int c = 0; c < CK; c++) {
+            int wb = (pc.w_off + (k0 + c) * np + co0) >> 1;
+            f16vec2 v = f16vec2(tile[c * 64 + t]);
+            [[unroll]] for (int j = 0; j < 32; j++)
+                acc[j] = fma(v, params[wb + j], acc[j]);
+        }
+    }
+
+    if (co0 >= pc.n)
+        return;
+    // Eight rows a round go through `staged`, so that eight neighbouring
+    // lanes write a row's 64 columns side by side instead of each lane
+    // writing its own row 16 bytes at a time. The rounds stay a loop: eight
+    // copies of the epilogue run slower than the scattered writes.
+    int q = t & 7;
+    int col = co0 + 8 * q;
+    [[dont_unroll]] for (int round = 0; round < 8; round++) {
+        if ((t >> 3) == round)
+            [[unroll]] for (int j = 0; j < 32; j++)
+                staged[wave][t & 7][j] = acc[j];
+        subgroupMemoryBarrierShared();
+        subgroupBarrier();
+        int r = r0 + 8 * round + (t >> 3);
+        int at;
+        if (pc.out_mode == 1) {
+            int quarter_n = pc.n >> 2;
+            int qn = co0 / quarter_n;
+            int y = r / pc.width;
+            int x = r - y * pc.width;
+            at = ((2 * y + (qn >> 1)) * 2 * pc.width + 2 * x + (qn & 1)) * pc.dst_stride + co0 - qn * quarter_n;
+        } else {
+            at = row_start(pc.out_mode, r, pc.dst_stride, pc.dst_off) + co0;
+        }
+        if (col < pc.n) {
+            bool wide = col + 8 <= pc.n && ((at + 8 * q) & 7) == 0;
+            int i = (at >> 3) + q;
+            uvec4 old = wide && pc.accumulate != 0 ? dst16[i] : uvec4(0);
+            uvec4 w;
+            [[unroll]] for (int h = 0; h < 4; h++) {
+                int j = 4 * q + h;
+                if (!wide && co0 + 2 * j >= pc.n)
+                    break;
+                vec2 v = vec2(staged[wave][t >> 3][j]);
+                if (pc.b_off >= 0)
+                    v += vec2(params[((pc.b_off + co0) >> 1) + j]);
+                if (pc.gelu != 0)
+                    v = vec2(gelu(v.x), gelu(v.y));
+                if (pc.accumulate != 0)
+                    v += wide ? vec2(unpackFloat2x16(old[h])) : vec2(dst[(at >> 1) + j]);
+                if (wide)
+                    w[h] = packFloat2x16(f16vec2(v));
+                else
+                    dst[(at >> 1) + j] = f16vec2(v);
+            }
+            if (wide)
+                dst16[i] = w;
+        }
+        subgroupBarrier();
+    }
+}

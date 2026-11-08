@@ -1,0 +1,24 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+authors = ["Bruno Gonçalves <www.biglinux.com.br>"]
+repository = "https://github.com/biglinux/image-engine-native"
+homepage = "https://www.biglinux.com.br"
+publish = false
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "warn"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1

@@ -1,0 +1,180 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_GOOGLE_include_directive : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+// gemm.comp for GPUs without a scalar path for uniform reads: a workgroup of
+// 256 invocations takes ROWS rows and COLS columns (64, or 32 for products
+// no wider), with a block of 16 rows of the weights staged in shared memory
+// beside the input's; each invocation computes RPT rows by 8 columns. Rows
+// past `rows` are neither read nor written.
+layout(local_size_x = 256) in;
+
+#include "gemm_layout.glsl"
+
+const int CK = 16;
+// Rows per invocation. Four rather than eight leave the registers for more
+// warps in flight, which hide the loads' latency better.
+const int RPT = 4;
+#ifndef COLS
+#define COLS 64
+#endif
+// Invocations across a block of columns.
+const int CG = COLS / 8;
+const int ROWS = 256 / CG * RPT;
+// The input tile, four rows to a vector: tile[k][rows / 4].
+shared f16vec4 tile[CK * ROWS / 4];
+shared f16vec2 weights[CK * COLS / 2];
+
+// Where the chunk k0.. of every row lies past the row's start.
+int chunk_off(int k0) {
+    if (pc.in_mode != 1)
+        return k0;
+    int quarter = pc.k >> 2;
+    int q = k0 / quarter;
+    return ((q >> 1) * 2 * pc.width + (q & 1)) * pc.src_stride + k0 - q * quarter;
+}
+
+void main() {
+    int t = int(gl_LocalInvocationID.x);
+    // Workgroups run in bands of G row blocks across every column block, so
+    // the ones in flight share both their input rows and their weights in
+    // the L2 cache.
+    const int G = 4;
+    int blocks = int(gl_NumWorkGroups.x);
+    int columns = int(gl_NumWorkGroups.y);
+    int l = int(gl_WorkGroupID.y) * blocks + int(gl_WorkGroupID.x);
+    int band = l / (G * columns);
+    int height = min(G, blocks - band * G);
+    int within = l - band * G * columns;
+    int r0 = (band * G + within % height) * ROWS;
+    int co0 = (within / height) * COLS;
+    int np = (pc.n + 63) & ~63;
+    int rg = t / CG;
+    int cg = t % CG;
+    // Each invocation loads a 4 x 4 block of each tile, values 4 kq ..
+    // 4 kq + 3 of rows 4 q .. 4 q + 3, and writes it to the tile transposed.
+    // Row starts and chunk offsets are multiples of 4.
+    int q = t >> 2;
+    int kq = t & 3;
+    int start[4];
+    [[unroll]] for (int i = 0; i < 4; i++)
+        start[i] = row_start(pc.in_mode, min(r0 + 4 * min(q, ROWS / 4 - 1) + i, pc.rows - 1), pc.src_stride, pc.src_off) >> 2;
+    f16vec4 next[4];
+
+    // The layer norm of the invocation's four rows: each sums its share of
+    // every chunk, and the four invocations of a row (neighbouring lanes)
+    // add their sums together.
+    vec4 mean = vec4(0.0);
+    vec4 scale = vec4(0.0);
+    if (pc.norm != 0) {
+        vec4 squares = vec4(0.0);
+        for (int k0 = 0; k0 < pc.k; k0 += CK) {
+            int off = (chunk_off(k0) >> 2) + kq;
+            [[unroll]] for (int i = 0; i < 4; i++) {
+                vec4 v = vec4(src4[start[i] + off]);
+                mean[i] += (v.x + v.y) + (v.z + v.w);
+                squares[i] += dot(v, v);
+            }
+        }
+        mean += subgroupShuffleXor(mean, 1);
+        squares += subgroupShuffleXor(squares, 1);
+        mean += subgroupShuffleXor(mean, 2);
+        squares += subgroupShuffleXor(squares, 2);
+        mean /= float(pc.k);
+        scale = inversesqrt(max(squares / float(pc.k) - mean * mean, 0.0) + 1e-5);
+    }
+
+    f16vec2 acc[RPT][4];
+    [[unroll]] for (int p = 0; p < RPT; p++)
+        [[unroll]] for (int j = 0; j < 4; j++)
+            acc[p][j] = f16vec2(0.0);
+    {
+        int off = (chunk_off(0) >> 2) + kq;
+        [[unroll]] for (int i = 0; i < 4; i++)
+            next[i] = src4[start[i] + off];
+    }
+    for (int k0 = 0; k0 < pc.k; k0 += CK) {
+        barrier();
+        if (pc.norm != 0) {
+            int kb = k0 + 4 * kq;
+            vec4 g = vec4(ps[pc.g_off + kb], ps[pc.g_off + kb + 1], ps[pc.g_off + kb + 2], ps[pc.g_off + kb + 3]);
+            vec4 b = vec4(ps[pc.beta_off + kb], ps[pc.beta_off + kb + 1], ps[pc.beta_off + kb + 2], ps[pc.beta_off + kb + 3]);
+            [[unroll]] for (int i = 0; i < 4; i++)
+                next[i] = f16vec4((vec4(next[i]) - mean[i]) * scale[i] * g + b);
+        }
+        if (q < ROWS / 4)
+            [[unroll]] for (int j = 0; j < 4; j++)
+                tile[(4 * kq + j) * (ROWS / 4) + q] = f16vec4(next[0][j], next[1][j], next[2][j], next[3][j]);
+        [[unroll]] for (int s = 0; s < CK * COLS / 512; s++) {
+            int i = t + 256 * s;
+            weights[i] = params[((pc.w_off + (k0 + i / (COLS / 2)) * np + co0) >> 1) + i % (COLS / 2)];
+        }
+        barrier();
+        if (k0 + CK < pc.k) {
+            int off = (chunk_off(k0 + CK) >> 2) + kq;
+            [[unroll]] for (int i = 0; i < 4; i++)
+                next[i] = src4[start[i] + off];
+        }
+        [[unroll]] for (int c = 0; c < CK; c++) {
+            f16vec2 w[4];
+            [[unroll]] for (int j = 0; j < 4; j++)
+                w[j] = weights[c * (COLS / 2) + cg * 4 + j];
+            [[unroll]] for (int h = 0; h < RPT / 4; h++) {
+                f16vec4 v = tile[c * (ROWS / 4) + rg * (RPT / 4) + h];
+                [[unroll]] for (int p = 0; p < 4; p++)
+                    [[unroll]] for (int j = 0; j < 4; j++)
+                        acc[4 * h + p][j] = fma(f16vec2(v[p]), w[j], acc[4 * h + p][j]);
+            }
+        }
+    }
+    int col0 = co0 + cg * 8;
+    if (col0 >= pc.n)
+        return;
+    [[unroll]] for (int p = 0; p < RPT; p++) {
+        int r = r0 + rg * RPT + p;
+        if (r >= pc.rows)
+            return;
+        int at;
+        if (pc.out_mode == 1) {
+            int quarter_n = pc.n >> 2;
+            int q = col0 / quarter_n;
+            int y = r / pc.width;
+            int x = r - y * pc.width;
+            at = ((2 * y + (q >> 1)) * 2 * pc.width + 2 * x + (q & 1)) * pc.dst_stride + col0 - q * quarter_n;
+        } else {
+            at = row_start(pc.out_mode, r, pc.dst_stride, pc.dst_off) + col0;
+        }
+        at >>= 1;
+        // Eight aligned columns go out in one 16-byte write instead of four.
+        if (col0 + 8 <= pc.n && (at & 3) == 0) {
+            uvec4 old = pc.accumulate != 0 ? dst16[at >> 2] : uvec4(0);
+            uvec4 w;
+            [[unroll]] for (int j = 0; j < 4; j++) {
+                vec2 v = vec2(acc[p][j]);
+                if (pc.b_off >= 0)
+                    v += vec2(params[((pc.b_off + col0) >> 1) + j]);
+                if (pc.gelu != 0)
+                    v = vec2(gelu(v.x), gelu(v.y));
+                if (pc.accumulate != 0)
+                    v += vec2(unpackFloat2x16(old[j]));
+                w[j] = packFloat2x16(f16vec2(v));
+            }
+            dst16[at >> 2] = w;
+            continue;
+        }
+        [[unroll]] for (int j = 0; j < 4; j++) {
+            if (col0 + 2 * j >= pc.n)
+                break;
+            vec2 v = vec2(acc[p][j]);
+            if (pc.b_off >= 0)
+                v += vec2(params[((pc.b_off + col0) >> 1) + j]);
+            if (pc.gelu != 0)
+                v = vec2(gelu(v.x), gelu(v.y));
+            if (pc.accumulate != 0)
+                v += vec2(dst[at + j]);
+            dst[at + j] = f16vec2(v);
+        }
+    }
+}

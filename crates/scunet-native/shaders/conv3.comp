@@ -1,0 +1,120 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// 3x3 convolution in half floats, NHWC with any pixel strides, plus an
+// optional ReLU, written or added. One wave of 64 lanes covers an 8 x 8
+// tile, one pixel per lane, for CO output channels per workgroup row of the
+// grid; the weights' index is the same in every lane, so AMD GPUs read them
+// through the scalar cache. Weights are [tap][cin][cout padded to 64].
+// 32 channels rather than 64 halve the registers, which lets more waves hide
+// the loads' latency on AMD's GCN.
+#define CO 32
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly restrict buffer Src { float16_t src[]; };
+layout(std430, binding = 0) readonly restrict buffer Src4 { f16vec4 src4[]; };
+layout(std430, binding = 1) restrict buffer Dst { float16_t dst[]; };
+layout(std430, binding = 1) restrict buffer Dst16 { uvec4 dst16[]; };
+layout(std430, binding = 2) readonly restrict buffer Params { f16vec2 params[]; };
+layout(push_constant) uniform PC {
+    int W; int H; int cin; int src_stride; int cout; int dst_stride; int dst_off;
+    int w_off; int relu; int accumulate;
+} pc;
+
+const int CK = 16;
+const int SW = 10;
+shared float16_t tile[CK * SW * SW];
+
+void main() {
+    int t = int(gl_LocalInvocationID.x);
+    int lx = t % 8;
+    int ly = t / 8;
+    int x0 = int(gl_WorkGroupID.x) * 8;
+    int y0 = int(gl_WorkGroupID.y) * 8;
+    int co0 = int(gl_WorkGroupID.z) * CO;
+    int np = (pc.cout + 63) & ~63;
+    f16vec2 acc[CO / 2];
+    vec2 total[CO / 2];
+    [[unroll]] for (int j = 0; j < CO / 2; j++)
+        total[j] = vec2(0.0);
+    for (int c0 = 0; c0 < pc.cin; c0 += CK) {
+        int ck = min(CK, pc.cin - c0);
+        if (((pc.cin | pc.src_stride) & 3) == 0) {
+            // Four channels of a pixel per load.
+            for (int i = t; i < SW * SW * CK / 4; i += 64) {
+                int c = 4 * (i % (CK / 4));
+                int q = i / (CK / 4);
+                int y = y0 + q / SW - 1;
+                int x = x0 + q % SW - 1;
+                f16vec4 v = f16vec4(0.0);
+                if (c < ck && y >= 0 && y < pc.H && x >= 0 && x < pc.W)
+                    v = src4[((y * pc.W + x) * pc.src_stride + c0 + c) >> 2];
+                [[unroll]] for (int j = 0; j < 4; j++)
+                    tile[((c + j) * SW + q / SW) * SW + q % SW] = v[j];
+            }
+        } else {
+            for (int i = t; i < SW * SW * CK; i += 64) {
+                int c = i % CK;
+                int q = i / CK;
+                int y = y0 + q / SW - 1;
+                int x = x0 + q % SW - 1;
+                float16_t v = float16_t(0.0);
+                if (c < ck && y >= 0 && y < pc.H && x >= 0 && x < pc.W)
+                    v = src[(y * pc.W + x) * pc.src_stride + c0 + c];
+                tile[(c * SW + q / SW) * SW + q % SW] = v;
+            }
+        }
+        barrier();
+        [[unroll]] for (int j = 0; j < CO / 2; j++)
+            acc[j] = f16vec2(0.0);
+        for (int c = 0; c < ck; c++) {
+            [[unroll]] for (int tap = 0; tap < 9; tap++) {
+                int wb = (pc.w_off + (tap * pc.cin + c0 + c) * np + co0) >> 1;
+                f16vec2 w[CO / 2];
+                [[unroll]] for (int j = 0; j < CO / 2; j++)
+                    w[j] = params[wb + j];
+                f16vec2 v = f16vec2(tile[(c * SW + ly + tap / 3) * SW + lx + tap % 3]);
+                [[unroll]] for (int j = 0; j < CO / 2; j++)
+                    acc[j] = fma(v, w[j], acc[j]);
+            }
+        }
+        [[unroll]] for (int j = 0; j < CO / 2; j++)
+            total[j] += vec2(acc[j]);
+        barrier();
+    }
+    int x = x0 + lx;
+    int y = y0 + ly;
+    if (x >= pc.W || y >= pc.H)
+        return;
+    int o = (y * pc.W + x) * pc.dst_stride + pc.dst_off + co0;
+    // A lane's pixel is apart from its neighbours', so where eight channels
+    // are aligned they go out in one 16-byte write instead of eight.
+    [[unroll]] for (int q = 0; q < CO / 8; q++) {
+        int c = co0 + 8 * q;
+        if (c + 8 <= pc.cout && ((o + 8 * q) & 7) == 0) {
+            int i = (o >> 3) + q;
+            uvec4 old = pc.accumulate != 0 ? dst16[i] : uvec4(0);
+            uvec4 w;
+            [[unroll]] for (int h = 0; h < 4; h++) {
+                vec2 v = total[4 * q + h];
+                if (pc.relu != 0)
+                    v = max(v, vec2(0.0));
+                if (pc.accumulate != 0)
+                    v += vec2(unpackFloat2x16(old[h]));
+                w[h] = packFloat2x16(f16vec2(v));
+            }
+            dst16[i] = w;
+            continue;
+        }
+        [[unroll]] for (int e = 0; e < 8; e++) {
+            if (c + e >= pc.cout)
+                return;
+            float v = total[4 * q + (e >> 1)][e & 1];
+            if (pc.relu != 0)
+                v = max(v, 0.0);
+            if (pc.accumulate != 0)
+                v += float(dst[o + 8 * q + e]);
+            dst[o + 8 * q + e] = float16_t(v);
+        }
+    }
+}

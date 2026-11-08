@@ -1,0 +1,31 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// The `splits` float partial sums of a product split along k (see
+// gemm_layout.glsl) added up, plus the bias, onto or over the half-float
+// output rows `dst_stride` apart from `dst_off`, then ReLU when `act` is 1.
+// An invocation per output value.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly restrict buffer Partials { float partials[]; };
+layout(std430, binding = 1) restrict buffer Dst { float16_t dst[]; };
+layout(std430, binding = 2) readonly restrict buffer Floats { float pf[]; };
+layout(push_constant) uniform PC {
+    int rows; int n; int splits; int dst_stride; int dst_off; int b_off; int act; int accumulate;
+} pc;
+
+void main() {
+    int e = int(gl_WorkGroupID.y * 65535u * 256u + gl_GlobalInvocationID.x);
+    if (e >= pc.rows * pc.n)
+        return;
+    int r = e / pc.n;
+    int col = e - r * pc.n;
+    float v = pc.b_off >= 0 ? pf[pc.b_off + col] : 0.0;
+    for (int z = 0; z < pc.splits; z++)
+        v += partials[(z * pc.rows + r) * pc.n + col];
+    int at = r * pc.dst_stride + pc.dst_off + col;
+    if (pc.accumulate != 0)
+        v += float(dst[at]);
+    if (pc.act == 1)
+        v = max(v, 0.0);
+    dst[at] = float16_t(v);
+}

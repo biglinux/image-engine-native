@@ -1,0 +1,79 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+// Attention of one head over one 7 x 7 window: a workgroup per (window,
+// head), two lanes per query token, each with half of the head's channels:
+// the pair adds its two halves of each score, and each keeps its half of
+// the output. Keys and values go through shared memory;
+// each lane keeps a running softmax over the 49 keys, so the scores never
+// exist all at once. The bias table holds, per class of window, each head's
+// 49 x 49 position bias plus any shift mask, in floats.
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly restrict buffer Qkv { float16_t qkv[]; };
+layout(std430, binding = 1) writeonly restrict buffer Out { float16_t dst[]; };
+layout(std430, binding = 2) readonly restrict buffer Params { float pf[]; };
+layout(push_constant) uniform PC {
+    int c; int heads; int windows; int shifted; int bias_off;
+} pc;
+
+const int N = 49;
+const int D = 32;
+// Channels each lane of a pair holds.
+const int H = D / 2;
+shared float16_t keys[N * D];
+shared float16_t values[N * D];
+
+void main() {
+    int w = int(gl_WorkGroupID.x);
+    int h = int(gl_WorkGroupID.y);
+    int id = int(gl_LocalInvocationID.x);
+    int i = id >> 1;
+    int u = id & 1;
+    int row = 3 * pc.c;
+    int base = w * N * row + h * D;
+    for (int e = id; e < N * D; e += 128) {
+        int j = e / D;
+        int d = e - j * D;
+        keys[e] = qkv[base + j * row + pc.c + d];
+        values[e] = qkv[base + j * row + 2 * pc.c + d];
+    }
+    barrier();
+    if (i >= N)
+        return;
+    int kind = 0;
+    if (pc.shifted != 0) {
+        int wy = w / pc.windows;
+        int wx = w - wy * pc.windows;
+        kind = int(wx == pc.windows - 1) + 2 * int(wy == pc.windows - 1);
+    }
+    int bias = pc.bias_off + ((kind * pc.heads + h) * N + i) * N;
+    float q[H];
+    [[unroll]] for (int d = 0; d < H; d++)
+        q[d] = float(qkv[base + i * row + u * H + d]) * 0.17677669529663687;
+    float m = -1e30;
+    float l = 0.0;
+    float acc[H];
+    [[unroll]] for (int d = 0; d < H; d++)
+        acc[d] = 0.0;
+    for (int j = 0; j < N; j++) {
+        float half_score = 0.0;
+        [[unroll]] for (int d = 0; d < H; d++)
+            half_score = fma(q[d], float(keys[j * D + u * H + d]), half_score);
+        // The same sum in both lanes of the pair: first half, then second.
+        float other = subgroupShuffleXor(half_score, 1);
+        float s = pf[bias + j] + (u == 0 ? half_score + other : other + half_score);
+        float top = max(m, s);
+        float rescale = exp(m - top);
+        float p = exp(s - top);
+        l = l * rescale + p;
+        [[unroll]] for (int d = 0; d < H; d++)
+            acc[d] = fma(p, float(values[j * D + u * H + d]), acc[d] * rescale);
+        m = top;
+    }
+    int at = (w * N + i) * pc.c + h * D + u * H;
+    float inv = 1.0 / l;
+    [[unroll]] for (int d = 0; d < H; d++)
+        dst[at + d] = float16_t(acc[d] * inv);
+}

@@ -1,0 +1,18 @@
+[package]
+name = "birefnet-native"
+description = "BiRefNet-lite background removal on the CPU in plain Rust: no ONNX Runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish.workspace = true
+
+[dependencies]
+native-engine = { path = "../native-engine" }
+native-vulkan = { path = "../native-vulkan" }
+
+[lints]
+workspace = true

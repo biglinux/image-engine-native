@@ -1,0 +1,44 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// The `side x side` RGB image rearranged, an invocation per value:
+// - mode 0: the patch embedding's rows, each 4 x 4 patch's pixels in order,
+//   three colours each;
+// - mode 1: `image2patches`, the image cut into `size x size` patches
+//   stacked as channels, patch (gy, gx) of colour c becoming channel
+//   (c * grid + gy) * grid + gx of pixel (y, x).
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly restrict buffer Src { float16_t image[]; };
+layout(std430, binding = 1) writeonly restrict buffer Dst { float16_t dst[]; };
+layout(push_constant) uniform PC {
+    int mode; int side; int size;
+} pc;
+
+void main() {
+    int e = int(gl_WorkGroupID.y * 65535u * 256u + gl_GlobalInvocationID.x);
+    if (e >= pc.side * pc.side * 3)
+        return;
+    int y, x, c;
+    if (pc.mode == 0) {
+        int token = e / 48;
+        int k = e - token * 48;
+        int grid = pc.side / 4;
+        int ty = token / grid;
+        int ky = k / 12;
+        y = ty * 4 + ky;
+        x = (token - ty * grid) * 4 + (k - ky * 12) / 3;
+        c = k % 3;
+    } else {
+        int grid = pc.side / pc.size;
+        int channels = 3 * grid * grid;
+        int p = e / channels;
+        int ch = e - p * channels;
+        c = ch / (grid * grid);
+        int gy = (ch / grid) % grid;
+        int gx = ch % grid;
+        int py = p / pc.size;
+        y = gy * pc.size + py;
+        x = gx * pc.size + p - py * pc.size;
+    }
+    dst[e] = image[(y * pc.side + x) * 3 + c];
+}

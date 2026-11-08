@@ -1,0 +1,62 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// The deformable convolution's input for pixels `first..first + rows` of a
+// `height x width x 64` map: for each tap of a `size x size` kernel, the 64
+// channels bilinearly sampled at the tap moved by its offset, times twice
+// the sigmoid of its modulator logit. A pixel's `3 * taps` offsets, in
+// floats, hold y then x per tap, then the logits. As torchvision's
+// `deform_conv2d`, a point more than a pixel outside the map reads zero, and
+// corners outside it count as zero. An invocation per eight channels of a
+// tap, which works out the tap's position once for them.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly restrict buffer Map { f16vec4 map[]; };
+layout(std430, binding = 1) readonly restrict buffer Offsets { float offsets[]; };
+layout(std430, binding = 2) writeonly restrict buffer Dst { f16vec4 dst[]; };
+layout(push_constant) uniform PC {
+    int width; int height; int first; int rows; int size;
+} pc;
+
+// Channels 8 g .. 8 g + 7 of pixel (y, x) times `weight`, added to `v`.
+void corner(int y, int x, int g, float weight, inout vec4 v[2]) {
+    if (y < 0 || x < 0 || y >= pc.height || x >= pc.width)
+        return;
+    int at = (y * pc.width + x) * 16 + 2 * g;
+    v[0] += weight * vec4(map[at]);
+    v[1] += weight * vec4(map[at + 1]);
+}
+
+void main() {
+    int taps = pc.size * pc.size;
+    int e = int(gl_WorkGroupID.y * 65535u * 256u + gl_GlobalInvocationID.x);
+    if (e >= pc.rows * taps * 8)
+        return;
+    int g = e & 7;
+    int rt = e >> 3;
+    int r = rt / taps;
+    int tap = rt - r * taps;
+    int p = pc.first + r;
+    int y = p / pc.width;
+    int x = p - y * pc.width;
+    int o = r * 3 * taps;
+    int half_size = pc.size >> 1;
+    int ty = tap / pc.size;
+    float py = float(y - half_size + ty) + offsets[o + 2 * tap];
+    float px = float(x - half_size + tap - ty * pc.size) + offsets[o + 2 * tap + 1];
+    float m = 2.0 / (1.0 + exp(-offsets[o + 2 * taps + tap]));
+    vec4 v[2] = vec4[2](vec4(0.0), vec4(0.0));
+    if (py > -1.0 && py < float(pc.height) && px > -1.0 && px < float(pc.width)) {
+        float fy = floor(py);
+        float fx = floor(px);
+        float ly = py - fy;
+        float lx = px - fx;
+        int y0 = int(fy);
+        int x0 = int(fx);
+        corner(y0, x0, g, (1.0 - ly) * (1.0 - lx), v);
+        corner(y0, x0 + 1, g, (1.0 - ly) * lx, v);
+        corner(y0 + 1, x0, g, ly * (1.0 - lx), v);
+        corner(y0 + 1, x0 + 1, g, ly * lx, v);
+    }
+    dst[2 * e] = f16vec4(v[0] * m);
+    dst[2 * e + 1] = f16vec4(v[1] * m);
+}

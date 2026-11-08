@@ -1,0 +1,59 @@
+#version 450
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// Layer normalisation of `c` channels per row, a workgroup per row: row r
+// read at `r * src_stride + src_off`, written at `r * dst_stride + dst_off`,
+// which may be where it was read. Workgroups past 65535 run along y.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer Src { float16_t src[]; };
+layout(std430, binding = 1) writeonly buffer Dst { float16_t dst[]; };
+layout(std430, binding = 2) readonly restrict buffer Params { float pf[]; };
+layout(push_constant) uniform PC {
+    int rows; int c; int src_stride; int src_off; int dst_stride; int dst_off; int g_off; int b_off;
+} pc;
+
+/// Channels per lane at most: 768 over 64 lanes.
+const int MAX = 12;
+shared float partial[64];
+
+float total(float v) {
+    int t = int(gl_LocalInvocationID.x);
+    partial[t] = v;
+    barrier();
+    for (int s = 32; s > 0; s >>= 1) {
+        if (t < s)
+            partial[t] += partial[t + s];
+        barrier();
+    }
+    float sum = partial[0];
+    barrier();
+    return sum;
+}
+
+void main() {
+    int r = int(gl_WorkGroupID.x) + int(gl_WorkGroupID.y) * 65535;
+    if (r >= pc.rows)
+        return;
+    int t = int(gl_LocalInvocationID.x);
+    int from = r * pc.src_stride + pc.src_off;
+    float v[MAX];
+    float sum = 0.0;
+    for (int i = 0; i < MAX; i++) {
+        int ch = t + 64 * i;
+        v[i] = ch < pc.c ? float(src[from + ch]) : 0.0;
+        sum += v[i];
+    }
+    float mean = total(sum) / float(pc.c);
+    float squares = 0.0;
+    for (int i = 0; i < MAX; i++) {
+        float d = t + 64 * i < pc.c ? v[i] - mean : 0.0;
+        squares = fma(d, d, squares);
+    }
+    float scale = inversesqrt(total(squares) / float(pc.c) + 1e-5);
+    int to = r * pc.dst_stride + pc.dst_off;
+    for (int i = 0; i < MAX; i++) {
+        int ch = t + 64 * i;
+        if (ch < pc.c)
+            dst[to + ch] = float16_t((v[i] - mean) * scale * pf[pc.g_off + ch] + pf[pc.b_off + ch]);
+    }
+}

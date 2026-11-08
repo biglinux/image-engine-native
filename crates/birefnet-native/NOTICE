@@ -1,0 +1,53 @@
+birefnet-native
+Copyright 2026 Bruno Gonçalves <www.biglinux.com.br>
+
+This crate is a Rust implementation of BiRefNet-lite's network, provided
+under MIT, as the model is. It reproduces the results of the projects below,
+measured by running them. The engines under it (crates/native-engine and
+crates/native-vulkan) and the work they build on are credited in the
+repository's NOTICE.
+
+1. BiRefNet (MIT), by Peng Zheng, Dehong Gao, Deng-Ping Fan, Li Liu, Jorma
+   Laaksonen, Wanli Ouyang and Nicu Sebe: "Bilateral Reference for
+   High-Resolution Dichotomous Image Segmentation", CAAI Artificial
+   Intelligence Research, 2024. https://github.com/ZhengPeng7/BiRefNet
+   The network, its weights (ZhengPeng7/BiRefNet_lite, MIT, Copyright (c)
+   2024 ZhengPeng) and the reference outputs it is checked against.
+   tools/birefnet/quantization_study.py restates the forward pass of BiRefNet's
+   DeformableConv2d with rounded weights. No weights are included:
+   tools/birefnet/export_weights.py converts an ONNX export of them that you obtain
+   yourself, and the weights files it writes stay under the model's MIT
+   licence (notice A), whose text has to travel with any of them you
+   redistribute.
+
+2. Swin Transformer (MIT), by Ze Liu, Yutong Lin, Yue Cao, Han Hu, Yixuan
+   Wei, Zheng Zhang, Stephen Lin and Baining Guo, Microsoft: the backbone.
+   https://github.com/microsoft/Swin-Transformer
+   Deformable convolution v2 as torchvision's deform_conv2d computes it
+   (BSD-3-Clause): Xizhou Zhu, Han Hu, Stephen Lin and Jifeng Dai,
+   "Deformable ConvNets v2", CVPR 2019. https://github.com/pytorch/vision
+
+
+A. BiRefNet, https://github.com/ZhengPeng7/BiRefNet, the licence of its weights
+
+MIT License
+
+Copyright (c) 2024 ZhengPeng
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
