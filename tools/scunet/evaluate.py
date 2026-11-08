@@ -61,7 +61,9 @@ def prepare(args):
         clean = image.resize((args.width, args.height), Image.LANCZOS, box=box)
         degraded = np.asarray(clean, dtype=np.float64)
         if args.sigma:
-            rng = np.random.default_rng(zlib.crc32(path.stem.encode()))
+            # Seeded by the name as the file systems may spell it either way.
+            name = unicodedata.normalize("NFC", path.stem)
+            rng = np.random.default_rng(zlib.crc32(name.encode()))
             degraded = degraded + rng.normal(0, args.sigma, degraded.shape)
         degraded = degraded.clip(0, 255).round().astype(np.uint8)
         if args.jpeg:

@@ -81,7 +81,8 @@ def prepare(args):
         box = (x0, y0, min(w, x0 + cw), min(h, y0 + ch))
         photo = image.resize((args.width, args.height), Image.LANCZOS, box=box)
         np.asarray(photo).tofile(out / f"{path.stem}.rgb")
-        mask = holes(path.stem, args.width, args.height)
+        # Seeded by the name as the file systems may spell it either way.
+        mask = holes(unicodedata.normalize("NFC", path.stem), args.width, args.height)
         mask.tofile(out / f"{path.stem}.mask")
         print(f"{path.stem}: holes {(mask > 0).mean():.0%}")
 
