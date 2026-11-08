@@ -10,6 +10,7 @@ pub type Object = u64;
 pub type Pfn = Option<unsafe extern "system" fn()>;
 
 pub const SUCCESS: i32 = 0;
+pub const ERROR_DEVICE_LOST: i32 = -4;
 pub const API_1_2: u32 = (1 << 22) | (2 << 12);
 pub const WHOLE_SIZE: u64 = !0;
 

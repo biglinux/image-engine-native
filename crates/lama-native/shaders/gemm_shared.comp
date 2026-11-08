@@ -1,0 +1,120 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// gemm.comp for GPUs without a scalar path for uniform reads: a workgroup of
+// 256 invocations takes 256 rows and 64 columns, with a block of 16 rows of
+// the weights staged in shared memory beside the input's; each invocation
+// computes 8 rows by 8 columns. Each invocation loads a 4 x 4 block of each
+// input tile, values 4 kq .. 4 kq + 3 of rows 4 q .. 4 q + 3, and writes it
+// to the tile transposed, so strides and offsets are multiples of 4.
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly restrict buffer Src { f16vec4 src4[]; };
+layout(std430, binding = 1) restrict buffer Dst { f16vec2 dst[]; };
+layout(std430, binding = 2) readonly restrict buffer Params { f16vec2 params[]; };
+layout(push_constant) uniform PC {
+    int rows; int k; int n; int src_stride; int src_off; int dst_stride; int dst_off;
+    int w_off; int b_off; int relu; int accumulate; int mode; int width; int height;
+    int py; int px;
+} pc;
+
+const int CK = 16;
+const int ROWS = 256;
+// The input tile, four rows to a vector: tile[k][rows / 4].
+shared f16vec4 tile[CK * ROWS / 4];
+shared f16vec2 weights[CK * 32];
+
+void main() {
+    int t = int(gl_LocalInvocationID.x);
+    int r0 = int(gl_WorkGroupID.x) * ROWS;
+    int co0 = int(gl_WorkGroupID.y) * 64;
+    int np = (pc.n + 63) & ~63;
+    int rg = t >> 3;
+    int cg = t & 7;
+    int q = t >> 2;
+    int kq = t & 3;
+    int row_y[4];
+    int row_x[4];
+    [[unroll]] for (int i = 0; i < 4; i++) {
+        int r = min(r0 + 4 * q + i, pc.rows - 1);
+        row_y[i] = r / pc.width;
+        row_x[i] = r - row_y[i] * pc.width;
+    }
+    int cin = pc.k / ((pc.py + 1) * (pc.px + 1));
+    f16vec2 acc[8][4];
+    [[unroll]] for (int p = 0; p < 8; p++)
+        [[unroll]] for (int j = 0; j < 4; j++)
+            acc[p][j] = f16vec2(0.0);
+    f16vec4 next[4];
+    for (int k0 = 0; k0 < pc.k; k0 += CK) {
+        // A chunk of 16 lies within one tap: cin is a multiple of 16.
+        int tap = k0 / cin;
+        int dy = tap / (pc.px + 1);
+        int dx = tap - dy * (pc.px + 1);
+        [[unroll]] for (int i = 0; i < 4; i++) {
+            int y = row_y[i];
+            int x = row_x[i];
+            bool inside = true;
+            int at;
+            if (pc.mode == 1) {
+                y += dy;
+                x += dx;
+                inside = y < pc.height && x < pc.width;
+                at = (min(y, pc.height - 1) * pc.width + min(x, pc.width - 1)) * pc.src_stride
+                    + k0 - tap * cin;
+            } else {
+                at = (y * pc.width + x) * pc.src_stride + pc.src_off + k0;
+            }
+            f16vec4 v = src4[(at >> 2) + kq];
+            next[i] = inside ? v : f16vec4(0.0);
+        }
+        barrier();
+        [[unroll]] for (int j = 0; j < 4; j++)
+            tile[(4 * kq + j) * 64 + q] = f16vec4(next[0][j], next[1][j], next[2][j], next[3][j]);
+        [[unroll]] for (int s = 0; s < 2; s++) {
+            int i = t + 256 * s;
+            weights[i] = params[((pc.w_off + (k0 + (i >> 5)) * np + co0) >> 1) + (i & 31)];
+        }
+        barrier();
+        [[unroll]] for (int c = 0; c < CK; c++) {
+            f16vec2 w[4];
+            [[unroll]] for (int j = 0; j < 4; j++)
+                w[j] = weights[c * 32 + cg * 4 + j];
+            [[unroll]] for (int h = 0; h < 2; h++) {
+                f16vec4 v = tile[c * 64 + rg * 2 + h];
+                [[unroll]] for (int p = 0; p < 4; p++)
+                    [[unroll]] for (int j = 0; j < 4; j++)
+                        acc[4 * h + p][j] = fma(f16vec2(v[p]), w[j], acc[4 * h + p][j]);
+            }
+        }
+    }
+    int col0 = co0 + cg * 8;
+    if (col0 >= pc.n)
+        return;
+    [[unroll]] for (int p = 0; p < 8; p++) {
+        int r = r0 + rg * 8 + p;
+        if (r >= pc.rows)
+            return;
+        int at;
+        if (pc.mode == 1) {
+            int y = r / pc.width;
+            int x = r - y * pc.width;
+            at = ((2 * y + pc.py) * 2 * pc.width + 2 * x + pc.px) * pc.dst_stride + col0;
+        } else {
+            at = r * pc.dst_stride + pc.dst_off + col0;
+        }
+        at >>= 1;
+        [[unroll]] for (int j = 0; j < 4; j++) {
+            if (col0 + 2 * j >= pc.n)
+                break;
+            vec2 v = vec2(acc[p][j]);
+            if (pc.b_off >= 0)
+                v += vec2(params[((pc.b_off + col0) >> 1) + j]);
+            if (pc.accumulate != 0)
+                v += vec2(dst[at + j]);
+            if (pc.relu != 0)
+                v = max(v, vec2(0.0));
+            dst[at + j] = f16vec2(v);
+        }
+    }
+}

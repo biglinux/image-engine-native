@@ -1,0 +1,116 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// One pass of the 2-D real Fourier transform of a `height x width` map of
+// `c` channels, by direct sums in floats, as PyTorch's rfftn and irfftn with
+// "ortho" scaling. A spectrum has `width / 2 + 1` columns, its pixels the
+// real parts of their channels, then the imaginary parts. An invocation
+// computes one channel of 16 outputs along one row or column, so that each
+// value it reads serves 16 sums; the passes are
+// - 0: rows of the half-float map to the float half spectrum;
+// - 1: columns of that to the half-float spectrum, scaled;
+// - 2: columns of a half-float spectrum back, to floats;
+// - 3: rows of that to the half-float map, scaled, plus `residual`; as
+//   irfftn, only the real part of the first column (and of the last, for an
+//   even width) counts.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly restrict buffer Half { float16_t half_in[]; };
+layout(std430, binding = 1) readonly restrict buffer Wide { float wide_in[]; };
+layout(std430, binding = 2) writeonly restrict buffer HalfOut { float16_t half_out[]; };
+layout(std430, binding = 3) writeonly restrict buffer WideOut { float wide_out[]; };
+layout(std430, binding = 4) readonly restrict buffer Residual { float16_t residual[]; };
+// cos and sin of tau i / width for i < width, then of tau i / height.
+layout(std430, binding = 5) readonly restrict buffer Twiddles { vec2 twiddles[]; };
+layout(push_constant) uniform PC {
+    int pass_; int height; int width; int c;
+} pc;
+
+const int OUTS = 16;
+
+void main() {
+    int ch = int(gl_GlobalInvocationID.x);
+    // The row (passes 0 and 3) or column (1 and 2) summed along.
+    int line = int(gl_WorkGroupID.y);
+    int first = int(gl_WorkGroupID.z) * OUTS;
+    int half_ = pc.width / 2 + 1;
+    int c = pc.c;
+    bool rows = pc.pass_ == 0 || pc.pass_ == 3;
+    int n = rows ? pc.width : pc.height;
+    // Outputs along the line, and terms of each sum.
+    int outs = pc.pass_ == 0 ? half_ : n;
+    int terms = pc.pass_ == 3 ? half_ : n;
+    // The angle indices are the same in every lane, so AMD GPUs read the
+    // twiddles through the scalar cache.
+    int table = rows ? 0 : pc.width;
+    if (ch >= c)
+        return;
+    // Output j's angle index for the current term, and its step per term.
+    int angle[OUTS];
+    int step[OUTS];
+    [[unroll]] for (int j = 0; j < OUTS; j++) {
+        angle[j] = 0;
+        step[j] = min(first + j, outs - 1) % n;
+    }
+    float re[OUTS];
+    float im[OUTS];
+    [[unroll]] for (int j = 0; j < OUTS; j++) {
+        re[j] = 0.0;
+        im[j] = 0.0;
+    }
+    float sign = pc.pass_ == 1 || pc.pass_ == 0 ? -1.0 : 1.0;
+    int nyquist = pc.width % 2 == 0 ? pc.width / 2 : -1;
+    for (int k = 0; k < terms; k++) {
+        float vr, vi = 0.0;
+        if (pc.pass_ == 0) {
+            vr = float(half_in[(line * pc.width + k) * c + ch]);
+        } else {
+            int i = rows ? (line * half_ + k) * 2 * c + ch : (k * half_ + line) * 2 * c + ch;
+            if (pc.pass_ == 2) {
+                vr = float(half_in[i]);
+                vi = float(half_in[i + c]);
+            } else {
+                vr = wide_in[i];
+                vi = wide_in[i + c];
+            }
+        }
+        // irfftn counts the other half of a row's spectrum through the
+        // conjugates of these columns, and the real part alone of the first
+        // and the even width's last.
+        if (pc.pass_ == 3 && k != 0 && k != nyquist) {
+            vr *= 2.0;
+            vi *= 2.0;
+        }
+        [[unroll]] for (int j = 0; j < OUTS; j++) {
+            vec2 t = twiddles[table + angle[j]];
+            float s = sign * t.y;
+            re[j] += vr * t.x - vi * s;
+            im[j] += vr * s + vi * t.x;
+            angle[j] += step[j];
+            if (angle[j] >= n)
+                angle[j] -= n;
+        }
+    }
+    float scale = inversesqrt(float(pc.height * pc.width));
+    [[unroll]] for (int j = 0; j < OUTS; j++) {
+        int o = first + j;
+        if (o >= outs)
+            break;
+        if (pc.pass_ == 0) {
+            int at = (line * half_ + o) * 2 * c + ch;
+            wide_out[at] = re[j];
+            wide_out[at + c] = im[j];
+        } else if (pc.pass_ == 1) {
+            int at = (o * half_ + line) * 2 * c + ch;
+            half_out[at] = float16_t(re[j] * scale);
+            half_out[at + c] = float16_t(im[j] * scale);
+        } else if (pc.pass_ == 2) {
+            int at = (o * half_ + line) * 2 * c + ch;
+            wide_out[at] = re[j];
+            wide_out[at + c] = im[j];
+        } else {
+            int at = (line * pc.width + o) * c + ch;
+            half_out[at] = float16_t(re[j] * scale + float(residual[at]));
+        }
+    }
+}

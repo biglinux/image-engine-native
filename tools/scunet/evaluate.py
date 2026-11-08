@@ -21,6 +21,7 @@ import argparse
 import io
 import pathlib
 import sys
+import unicodedata
 import zlib
 
 import numpy as np
@@ -30,11 +31,27 @@ from PIL import Image
 def prepare(args):
     out = pathlib.Path(args.out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    photos = {}
     for path in sorted(pathlib.Path(args.img_dir).iterdir()):
         try:
-            image = Image.open(path).convert("RGB")
+            with Image.open(path) as image:
+                image.load()
         except OSError:
             print(f"skipped {path.name}: not an image", file=sys.stderr)
+            continue
+        # Names that differ in case or Unicode normalization only collide
+        # on some file systems.
+        key = unicodedata.normalize("NFC", path.stem).casefold()
+        other = photos.setdefault(key, path)
+        if other != path:
+            sys.exit(f"{path.name} and {other.name} would write the same files")
+    if not photos:
+        sys.exit(f"no photo in {args.img_dir}")
+    for path in photos.values():
+        try:
+            image = Image.open(path).convert("RGB")
+        except OSError as e:
+            print(f"skipped {path.name}: {e}", file=sys.stderr)
             continue
         w, h = image.size
         scale = min(w / args.width, h / args.height)
@@ -44,7 +61,9 @@ def prepare(args):
         clean = image.resize((args.width, args.height), Image.LANCZOS, box=box)
         degraded = np.asarray(clean, dtype=np.float64)
         if args.sigma:
-            rng = np.random.default_rng(zlib.crc32(path.stem.encode()))
+            # Seeded by the name as the file systems may spell it either way.
+            name = unicodedata.normalize("NFC", path.stem)
+            rng = np.random.default_rng(zlib.crc32(name.encode()))
             degraded = degraded + rng.normal(0, args.sigma, degraded.shape)
         degraded = degraded.clip(0, 255).round().astype(np.uint8)
         if args.jpeg:
@@ -70,7 +89,10 @@ def to_8bit(out):
 def compare(args):
     shape = (args.height, args.width, 3)
     worst, mean, differ, total = 0.0, [], 0, 0
-    for path in sorted(pathlib.Path(args.dir).glob("*.rgb")):
+    paths = sorted(pathlib.Path(args.dir).glob("*.rgb"))
+    if not paths:
+        sys.exit(f"no NAME.rgb in {args.dir}")
+    for path in paths:
         clean = np.fromfile(path.with_suffix(".clean"), np.uint8).reshape(shape)
         degraded = np.fromfile(path, np.uint8).reshape(shape)
         out = np.fromfile(path.with_suffix(f".{args.tag}.out"), "<f4").reshape(shape)

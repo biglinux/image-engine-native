@@ -7,6 +7,10 @@ use std::ptr::{null, null_mut};
 use crate::check;
 use crate::ffi::{self, Handle};
 
+/// Invocations of the largest workgroup the models' shaders declare, all
+/// along x. Vulkan guarantees only 128.
+const INVOCATIONS: u32 = 256;
+
 /// An instance, destroyed when dropped.
 pub(crate) struct Instance {
     pub(crate) handle: Handle,
@@ -15,8 +19,8 @@ pub(crate) struct Instance {
 
 impl Drop for Instance {
     fn drop(&mut self) {
-        // SAFETY: the device made from it, if any, is already destroyed: it
-        // is owned by the `Device` holding this instance, dropped first.
+        // SAFETY: the device made from it, if any, is already destroyed: the
+        // `Device` holding this instance drops it only after that.
         unsafe { (self.i.destroy_instance)(self.handle, null()) };
     }
 }
@@ -135,6 +139,15 @@ pub(crate) fn choose(instance: &Instance) -> Result<Choice, String> {
         };
         if props.api_version < ffi::API_1_2 {
             rejected.push(format!("{name}: Vulkan older than 1.2"));
+            continue;
+        }
+        let limits = &props.limits;
+        if limits.max_compute_work_group_invocations < INVOCATIONS
+            || limits.max_compute_work_group_size[0] < INVOCATIONS
+        {
+            rejected.push(format!(
+                "{name}: workgroups under {INVOCATIONS} invocations"
+            ));
             continue;
         }
         if !has_half_floats(i, pd) {

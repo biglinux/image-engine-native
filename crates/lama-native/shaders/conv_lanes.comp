@@ -1,0 +1,103 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// conv.comp's 3x3 convolutions of stride S with the roles of lanes swapped, for
+// AMD GPUs: a wave of 64 lanes takes P neighbouring output pixels of a row
+// and 128 output channels, two per lane. The input values are the same in
+// every lane, so they come through the scalar cache, and each lane keeps its
+// channels' weights in registers for the P pixels; there is no shared tile
+// and no barrier. The products of each block of 8 input channels and one
+// kernel row are summed in half floats and the blocks in floats; cin is a
+// multiple of 8.
+
+// Output pixels per wave; 8 and 24 run slower.
+const int P = 16;
+#ifndef S
+#define S 1
+#endif
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly restrict buffer Src { f16vec4 src4[]; };
+layout(std430, binding = 1) restrict buffer Dst { f16vec2 dst[]; };
+layout(std430, binding = 2) readonly restrict buffer Params { f16vec2 params[]; };
+layout(push_constant) uniform PC {
+    int W; int H; int OW; int OH; int cin; int src_stride; int cout; int dst_stride;
+    int dst_off; int w_off; int b_off; int act; int accumulate;
+} pc;
+
+const int CB = 8;
+
+// Clamped too: a workgroup also reads for the pixels past the row's end that
+// it computes and drops, and on a small map those reflect out of it.
+int reflect(int i, int n) {
+    return clamp(min(abs(i), 2 * (n - 1) - i), 0, n - 1);
+}
+
+float activate(float v) {
+    if (pc.act == 1)
+        return max(v, 0.0);
+    if (pc.act == 2)
+        return 1.0 / (1.0 + exp(-v));
+    return v;
+}
+
+void main() {
+    int t = int(gl_LocalInvocationID.x);
+    int x0 = int(gl_WorkGroupID.x) * P;
+    int y = int(gl_WorkGroupID.y);
+    int np = (pc.cout + 63) & ~63;
+    // Clamped so that lanes past the padded columns read valid weights; they
+    // write nothing.
+    int co = min(int(gl_WorkGroupID.z) * 128 + 2 * t, np - 2);
+    // w_off and np are even (arrays start at multiples of 8), so a weight's
+    // index splits into a uniform part and the lane's: the compiler then
+    // adds the uniform part to the load as a scalar offset instead of
+    // computing every address in vector registers.
+    int lane = co >> 1;
+    vec2 total[P];
+    [[unroll]] for (int p = 0; p < P; p++)
+        total[p] = vec2(0.0);
+    for (int c0 = 0; c0 < pc.cin; c0 += CB) {
+        [[unroll]] for (int ky = 0; ky < 3; ky++) {
+            int iy = reflect(y * S + ky - 1, pc.H);
+            f16vec2 w[3][CB];
+            [[unroll]] for (int kx = 0; kx < 3; kx++)
+                [[unroll]] for (int c = 0; c < CB; c++)
+                    w[kx][c] = params[((pc.w_off + ((ky * 3 + kx) * pc.cin + c0 + c) * np) >> 1) + lane];
+            f16vec2 acc[P];
+            [[unroll]] for (int p = 0; p < P; p++)
+                acc[p] = f16vec2(0.0);
+            // Input pixel j of the row feeds output pixel (j - kx) / S.
+            [[unroll]] for (int j = 0; j < S * (P - 1) + 3; j++) {
+                int ix = reflect(x0 * S + j - 1, pc.W);
+                int at = ((iy * pc.W + ix) * pc.src_stride + c0) >> 2;
+                f16vec4 a = src4[at];
+                f16vec4 b = src4[at + 1];
+                float16_t x[CB] = float16_t[CB](a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w);
+                [[unroll]] for (int kx = 0; kx < 3; kx++) {
+                    int p = (j - kx) / S;
+                    if (j < kx || (j - kx) % S != 0 || p >= P)
+                        continue;
+                    [[unroll]] for (int c = 0; c < CB; c++)
+                        acc[p] = fma(f16vec2(x[c]), w[kx][c], acc[p]);
+                }
+            }
+            [[unroll]] for (int p = 0; p < P; p++)
+                total[p] += vec2(acc[p]);
+        }
+    }
+    if (int(gl_WorkGroupID.z) * 128 + 2 * t >= pc.cout)
+        return;
+    [[unroll]] for (int p = 0; p < P; p++) {
+        int x = x0 + p;
+        if (x >= pc.OW)
+            break;
+        int at = ((y * pc.OW + x) * pc.dst_stride + pc.dst_off + co) >> 1;
+        vec2 v = total[p];
+        if (pc.b_off >= 0)
+            v += vec2(params[(pc.b_off + co) >> 1]);
+        if (pc.accumulate != 0)
+            v += vec2(dst[at]);
+        dst[at] = f16vec2(activate(v.x), activate(v.y));
+    }
+}

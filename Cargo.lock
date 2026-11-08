@@ -11,12 +11,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "lama-native"
+version = "0.1.0"
+dependencies = [
+ "native-engine",
+ "native-vulkan",
+]
+
+[[package]]
 name = "native-engine"
 version = "0.1.0"
 
 [[package]]
 name = "native-vulkan"
 version = "0.1.0"
+
+[[package]]
+name = "realesrgan-native"
+version = "0.1.0"
+dependencies = [
+ "native-engine",
+ "native-vulkan",
+]
 
 [[package]]
 name = "scunet-native"

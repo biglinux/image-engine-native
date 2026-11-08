@@ -1,0 +1,150 @@
+# Maintainer: Bruno Goncalves <bigbruno@gmail.com>
+# shellcheck shell=bash disable=SC2034,SC2154
+
+pkgbase=image-engine-native
+pkgname=(birefnet-native scunet-native realesrgan-native lama-native)
+pkgdesc="Image models on the CPU or a Vulkan GPU in plain Rust, with their weights"
+
+# Rolling package, versioned by build date like ppocr-native.
+# makepkg sources this file again after the build; SOURCE_DATE_EPOCH, which it
+# fixes at start, keeps the date from moving between the build and the package.
+pkgver=$(date -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" +%y.%m.%d)
+pkgrel=$(date -d "@${SOURCE_DATE_EPOCH:-$(date +%s)}" +%H%M)
+# The weights are the same on every architecture; the vector kernels and the
+# tests across them are x86_64's. The code also builds for aarch64.
+arch=('x86_64')
+url="https://github.com/biglinux/image-engine-native"
+# BSD-3-Clause for the parts of the engine that follow XNNPACK (NOTICE).
+license=('MIT' 'BSD-3-Clause')
+depends=('glibc' 'libgcc')
+# Each model's weights are exported here from the files its authors publish,
+# so the repository keeps no binaries.
+makedepends=(
+	'cargo'
+	'git'
+	'python'
+	'python-numpy'
+	'python-onnx'
+	'shaderc'
+)
+
+# onnx-community/BiRefNet_lite-ONNX and the Big LaMa mirror at fixed revisions.
+_birefnet=de15b22ba131738a16dff04aab8bdf8dc32e3ac1
+_lama=05cb2be7f8dbe6ca7c6e78f4fc827a4b2baaa4a9
+_esrgan=https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0
+source=(
+	"${pkgbase}::git+${url}.git"
+	"birefnet-lite-${_birefnet}.onnx::https://huggingface.co/onnx-community/BiRefNet_lite-ONNX/resolve/${_birefnet}/onnx/model.onnx"
+	"scunet_color_real_psnr.pth::https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_psnr.pth"
+	"realesr-general-x4v3.pth::${_esrgan}/realesr-general-x4v3.pth"
+	"realesr-general-wdn-x4v3.pth::${_esrgan}/realesr-general-wdn-x4v3.pth"
+	"big-lama-${_lama}.zip::https://huggingface.co/smartywu/big-lama/resolve/${_lama}/big-lama.zip"
+)
+# The LaMa exporter reads the archive itself.
+noextract=("big-lama-${_lama}.zip")
+sha256sums=(
+	'SKIP'
+	'5600024376f572a557870a5eb0afb1e5961636bef4e1e22132025467d0f03333'
+	'fa78899ba2caec9d235a900e91d96c689da71c42029230c2028b00f09f809c2e'
+	'8dc7edb9ac80ccdc30c3a5dca6616509367f05fbc184ad95b731f05bece96292'
+	'1641f8c4464b9f097c9fdda5589273713f67cf59f3d909e0bd688f0cee269dca'
+	'f1b358ca24093b93a106183b98a3dea6e8ed09f3b43ea7251eb2c81e7b4575f6'
+)
+
+prepare() {
+	cd "${srcdir}/${pkgbase}" || return 1
+	export RUSTUP_TOOLCHAIN=stable
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+	cd "${srcdir}/${pkgbase}" || return 1
+	export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target CARGO_INCREMENTAL=0
+	cargo build --frozen --release --workspace --bins
+
+	mkdir -p weights
+	python -I tools/birefnet/export_weights.py --half \
+		"${srcdir}/birefnet-lite-${_birefnet}.onnx" weights/birefnet-lite-f16.weights
+	python -I tools/scunet/export_weights.py --half \
+		"${srcdir}/scunet_color_real_psnr.pth" weights/scunet-color-real-psnr-f16.weights
+	# Real-ESRGAN's own default: both checkpoints blended half and half.
+	python -I tools/realesrgan/export_weights.py \
+		--weak "${srcdir}/realesr-general-wdn-x4v3.pth" --strength 0.5 \
+		"${srcdir}/realesr-general-x4v3.pth" weights/realesr-general-x4v3-dn50.weights
+	python -I tools/lama/export_weights.py --half \
+		"${srcdir}/big-lama-${_lama}.zip" weights/big-lama-f16.weights
+}
+
+# The finite output of one bench run: VALUES little-endian floats in FILE.
+_check_output() {
+	python -I -c 'import sys, numpy as np
+out = np.fromfile(sys.argv[1], "<f4")
+sys.exit(out.size != int(sys.argv[2]) or not np.isfinite(out).all())' "$1" "$2"
+}
+
+check() {
+	cd "${srcdir}/${pkgbase}" || return 1
+	export RUSTUP_TOOLCHAIN=stable CARGO_TARGET_DIR=target CARGO_INCREMENTAL=0
+	# Kernels are chosen at run time: every tier must pass the same tests, and
+	# each model's exported weights must load and give a finite output. The
+	# tiers are the CPU's, so the GPU of the build machine stays unused.
+	local bin=target/release
+	head -c $((256 * 256 * 3)) /dev/zero > square.rgb
+	head -c $((96 * 64 * 3)) /dev/zero > small.rgb
+	head -c $((96 * 64)) /dev/zero | tr '\0' '\377' > small.mask
+	local tier
+	export IMAGE_ENGINE_NATIVE_GPU=0
+	for tier in 2 1 0; do
+		export IMAGE_ENGINE_NATIVE_TIER=$tier
+		cargo test --frozen --release --workspace
+		"$bin/birefnet-bench" weights/birefnet-lite-f16.weights 256 --tag b square.rgb
+		_check_output square.b.logits $((256 * 256))
+		"$bin/scunet-bench" weights/scunet-color-real-psnr-f16.weights 96 64 --tag s small.rgb
+		_check_output small.s.out $((96 * 64 * 3))
+		"$bin/realesrgan-bench" weights/realesr-general-x4v3-dn50.weights 96 64 --tag r small.rgb
+		_check_output small.r.out $((384 * 256 * 3))
+		"$bin/lama-bench" weights/big-lama-f16.weights 96 64 --tag l small.rgb
+		_check_output small.l.out $((96 * 64 * 3))
+	done
+	unset IMAGE_ENGINE_NATIVE_TIER IMAGE_ENGINE_NATIVE_GPU
+}
+
+# Install a model's bench, weights and notices; the repository's LICENSE and
+# NOTICE cover the code, the crate's NOTICE the model and its weights.
+_install_model() {
+	local crate=$1 weights=$2
+	cd "${srcdir}/${pkgbase}" || return 1
+	install -Dm755 "target/release/${crate%-native}-bench" -t "${pkgdir}/usr/bin"
+	install -Dm644 "weights/${weights}" -t "${pkgdir}/usr/share/${crate}"
+	install -Dm644 LICENSE -t "${pkgdir}/usr/share/licenses/${crate}"
+	install -Dm644 NOTICE "${pkgdir}/usr/share/licenses/${crate}/NOTICE.image-engine-native"
+	install -Dm644 "crates/${crate}/NOTICE" -t "${pkgdir}/usr/share/licenses/${crate}"
+}
+
+package_birefnet-native() {
+	pkgdesc="BiRefNet-lite background removal on the CPU or a Vulkan GPU in plain Rust, with its half-float weights"
+	license=('MIT' 'BSD-3-Clause')
+	optdepends=('vulkan-icd-loader: background removal on a GPU, with its Vulkan driver')
+	_install_model birefnet-native birefnet-lite-f16.weights
+}
+
+package_scunet-native() {
+	pkgdesc="SCUNet image denoising on the CPU or a Vulkan GPU in plain Rust, with its half-float weights"
+	license=('MIT' 'BSD-3-Clause' 'Apache-2.0')
+	optdepends=('vulkan-icd-loader: denoising on a GPU, with its Vulkan driver')
+	_install_model scunet-native scunet-color-real-psnr-f16.weights
+}
+
+package_realesrgan-native() {
+	pkgdesc="Real-ESRGAN 4x image upscaling on the CPU or a Vulkan GPU in plain Rust, with its weights"
+	license=('MIT' 'BSD-3-Clause')
+	optdepends=('vulkan-icd-loader: upscaling on a GPU, with its Vulkan driver')
+	_install_model realesrgan-native realesr-general-x4v3-dn50.weights
+}
+
+package_lama-native() {
+	pkgdesc="LaMa image inpainting on the CPU or a Vulkan GPU in plain Rust, with its half-float weights"
+	license=('MIT' 'BSD-3-Clause' 'Apache-2.0')
+	optdepends=('vulkan-icd-loader: inpainting on a GPU, with its Vulkan driver')
+	_install_model lama-native big-lama-f16.weights
+}

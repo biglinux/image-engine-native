@@ -19,6 +19,7 @@ import argparse
 import pathlib
 import sys
 import time
+import unicodedata
 
 import numpy as np
 
@@ -61,11 +62,27 @@ def prepare(args):
 
     out = pathlib.Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
+    photos = {}
     for path in sorted(pathlib.Path(args.images).iterdir()):
         try:
-            image = Image.open(path).convert("RGB")
+            with Image.open(path) as image:
+                image.load()
         except OSError:
             print(f"{path.name}: not an image, skipped", file=sys.stderr)
+            continue
+        # Names that differ in case or Unicode normalization only collide
+        # on some file systems.
+        key = unicodedata.normalize("NFC", path.stem).casefold()
+        other = photos.setdefault(key, path)
+        if other != path:
+            sys.exit(f"{path.name} and {other.name} would write the same files")
+    if not photos:
+        sys.exit(f"no photo in {args.images}")
+    for path in photos.values():
+        try:
+            image = Image.open(path).convert("RGB")
+        except OSError as e:
+            print(f"{path.name}: {e}, skipped", file=sys.stderr)
             continue
         image = image.resize((args.side, args.side), Image.LANCZOS)
         np.asarray(image, dtype=np.uint8).tofile(out / f"{path.stem}.rgb")
@@ -75,13 +92,16 @@ def prepare(args):
 def ort(args):
     import onnxruntime
 
+    paths = sorted(pathlib.Path(args.rgb_dir).glob("*.rgb"))
+    if not paths:
+        sys.exit(f"no NAME.rgb in {args.rgb_dir}")
     options = onnxruntime.SessionOptions()
     options.intra_op_num_threads = args.threads
     session = onnxruntime.InferenceSession(
         args.model, options, providers=["CPUExecutionProvider"]
     )
     name = session.get_inputs()[0].name
-    for path in sorted(pathlib.Path(args.rgb_dir).glob("*.rgb")):
+    for path in paths:
         start = time.perf_counter()
         (logits,) = session.run(None, {name: normalized_nchw(read_rgb(path))})
         elapsed = time.perf_counter() - start

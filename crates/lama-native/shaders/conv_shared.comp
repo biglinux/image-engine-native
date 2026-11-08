@@ -1,0 +1,162 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+// The 3x3 conv.comp of stride S for GPUs without a scalar path for uniform
+// reads: the weights of each block of 16 input channels are staged in shared
+// memory. A workgroup covers PX x TY output pixels for 64 output channels;
+// each invocation one row of PX pixels for 8 channels, reading each input
+// row of IX pixels once for the three kernel columns. The input tile keeps a
+// pixel's channels together, so one 16-byte read brings eight of them. Each
+// block's products are summed in half floats and added to float totals; the
+// input is padded by reflection.
+#ifndef S
+#define S 1
+#endif
+// Rows of output pixels per workgroup: 32, or 16 at stride 2, whose input
+// rows would not fit in shared memory beside the weights otherwise.
+const int TY = 32 / S;
+const int LS = 8 * TY;
+// Output pixels along a row per invocation.
+const int PX = 4;
+layout(local_size_x = LS) in;
+layout(std430, binding = 0) readonly restrict buffer Src { f16vec4 src4[]; };
+layout(std430, binding = 1) restrict buffer Dst { float16_t dst[]; };
+layout(std430, binding = 1) restrict buffer Dst16 { uvec4 dst16[]; };
+layout(std430, binding = 2) readonly restrict buffer Params { f16vec2 params[]; };
+layout(std430, binding = 2) readonly restrict buffer Params4 { uvec4 params4[]; };
+layout(push_constant) uniform PC {
+    int W; int H; int OW; int OH; int cin; int src_stride; int cout; int dst_stride;
+    int dst_off; int w_off; int b_off; int act; int accumulate;
+} pc;
+
+int reflect(int i, int n) {
+    return min(abs(i), 2 * (n - 1) - i);
+}
+
+const int CK = 16;
+// Input columns and rows a workgroup reads, and the row pitch in pixels in
+// shared memory: one more than IX, so that the four rows a warp reads at
+// once fall in different banks.
+const int IX = (PX - 1) * S + 3;
+const int IY = (TY - 1) * S + 3;
+const int SW = IX + 1;
+// tile_in[(y * SW + x) * CK / 4 + c / 4]: channels c .. c + 3 of pixel (y, x).
+shared f16vec4 tile_in[IY * SW * CK / 4];
+// Four column pairs to a vector: the weights start at a multiple of 8.
+shared uvec4 tile_w[9 * CK * 8];
+
+void main() {
+    int t = int(gl_LocalInvocationID.x);
+    int x0 = int(gl_WorkGroupID.x) * PX;
+    int y0 = int(gl_WorkGroupID.y) * TY;
+    int co0 = int(gl_WorkGroupID.z) * 64;
+    int np = (pc.cout + 63) & ~63;
+    int cg = t % 8;
+    int row = t / 8;
+    vec2 total[PX][4];
+    [[unroll]] for (int p = 0; p < PX; p++)
+        [[unroll]] for (int j = 0; j < 4; j++)
+            total[p][j] = vec2(0.0);
+    for (int c0 = 0; c0 < pc.cin; c0 += CK) {
+        int ck = min(CK, pc.cin - c0);
+        // Four channels of a pixel per load: cin and the pixel stride are
+        // multiples of 4.
+        for (int i = t; i < IY * IX * CK / 4; i += LS) {
+            int c = 4 * (i % (CK / 4));
+            int q = i / (CK / 4);
+            int iy = y0 * S + q / IX - 1;
+            int ix = x0 * S + q % IX - 1;
+            int y = reflect(iy, pc.H);
+            int x = reflect(ix, pc.W);
+            f16vec4 v = f16vec4(0.0);
+            if (c < ck && iy < pc.H + 1 && ix < pc.W + 1)
+                v = src4[((min(y, pc.H - 1) * pc.W + min(x, pc.W - 1)) * pc.src_stride + c0 + c) >> 2];
+            tile_in[((q / IX) * SW + q % IX) * (CK / 4) + c / 4] = v;
+        }
+        for (int i = t; i < 9 * CK * 8; i += LS) {
+            int o = i % 8;
+            int r = i / 8;
+            int c = r % CK;
+            int tap = r / CK;
+            uvec4 v = uvec4(0);
+            if (c < ck)
+                v = params4[((pc.w_off + (tap * pc.cin + c0 + c) * np + co0) >> 3) + o];
+            tile_w[i] = v;
+        }
+        barrier();
+        f16vec2 acc[PX][4];
+        [[unroll]] for (int p = 0; p < PX; p++)
+            [[unroll]] for (int j = 0; j < 4; j++)
+                acc[p][j] = f16vec2(0.0);
+        // Channels past ck are zero in the tile and the weights.
+        [[unroll]] for (int c8 = 0; c8 < CK; c8 += 8) {
+            [[unroll]] for (int ky = 0; ky < 3; ky++) {
+                f16vec4 v[IX][2];
+                int ib = ((row * S + ky) * SW) * (CK / 4) + c8 / 4;
+                [[unroll]] for (int k = 0; k < IX; k++) {
+                    v[k][0] = tile_in[ib + k * (CK / 4)];
+                    v[k][1] = tile_in[ib + k * (CK / 4) + 1];
+                }
+                [[unroll]] for (int kx = 0; kx < 3; kx++) {
+                    [[unroll]] for (int c = 0; c < 8; c++) {
+                        uvec4 wq = tile_w[((ky * 3 + kx) * CK + c8 + c) * 8 + cg];
+                        f16vec2 w[4];
+                        [[unroll]] for (int j = 0; j < 4; j++)
+                            w[j] = unpackFloat2x16(wq[j]);
+                        [[unroll]] for (int p = 0; p < PX; p++)
+                            [[unroll]] for (int j = 0; j < 4; j++)
+                                acc[p][j] = fma(f16vec2(v[p * S + kx][c >> 2][c & 3]), w[j], acc[p][j]);
+                    }
+                }
+            }
+        }
+        [[unroll]] for (int p = 0; p < PX; p++)
+            [[unroll]] for (int j = 0; j < 4; j++)
+                total[p][j] += vec2(acc[p][j]);
+        barrier();
+    }
+    int y = y0 + row;
+    if (y >= pc.OH)
+        return;
+    [[unroll]] for (int p = 0; p < PX; p++) {
+        int x = x0 + p;
+        if (x >= pc.OW)
+            return;
+        int o = (y * pc.OW + x) * pc.dst_stride + pc.dst_off;
+        // Eight aligned channels go out in one 16-byte write instead of eight.
+        int c8 = co0 + cg * 8;
+        if (c8 + 8 <= pc.cout && ((o + c8) & 7) == 0) {
+            int i = (o + c8) >> 3;
+            uvec4 old = pc.accumulate != 0 ? dst16[i] : uvec4(0);
+            uvec4 w;
+            [[unroll]] for (int j = 0; j < 4; j++) {
+                vec2 v = total[p][j];
+                if (pc.b_off >= 0)
+                    v += vec2(params[(pc.b_off + c8 + 2 * j) >> 1]);
+                if (pc.accumulate != 0)
+                    v += unpackFloat2x16(old[j]);
+                if (pc.act == 1)
+                    v = max(v, vec2(0.0));
+                w[j] = packFloat2x16(f16vec2(v));
+            }
+            dst16[i] = w;
+            continue;
+        }
+        [[unroll]] for (int j = 0; j < 4; j++) {
+            [[unroll]] for (int h = 0; h < 2; h++) {
+                int co = co0 + cg * 8 + 2 * j + h;
+                if (co >= pc.cout)
+                    break;
+                float v = total[p][j][h];
+                if (pc.b_off >= 0)
+                    v += float(params[(pc.b_off + co) >> 1][co & 1]);
+                if (pc.accumulate != 0)
+                    v += float(dst[o + co]);
+                if (pc.act == 1)
+                    v = max(v, 0.0);
+                dst[o + co] = float16_t(v);
+            }
+        }
+    }
+}

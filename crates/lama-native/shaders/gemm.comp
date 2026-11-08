@@ -1,0 +1,134 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_ballot : require
+// out[r][col] (=, +=) act(... + sum_k in[r][k] * W[k][col] + bias[col]) in
+// half floats, the activation (none or ReLU) taken after the sum, for the 1x1
+// convolutions and the phases of the transposed convolutions. A workgroup
+// takes 64 rows and WAVES blocks of 64 columns, one per wave of 64 lanes,
+// which share each tile of the input; a lane computes one row, and rows from
+// `rows` on are neither read nor written. The weights' index is the same in
+// every lane of a wave, so AMD GPUs read them through the scalar cache. W is
+// stored [k][n padded to 64]; k is a multiple of 16.
+//
+// In mode 0 row r is `r * stride + off` on both sides. In mode 1, a phase
+// (py, px) of the 3x3 stride-2 transposed convolution: row r is input pixel
+// (y, x) of a `width x height` map, k runs over the input pixels
+// (y + dy, x + dx), dy <= py and dx <= px, zero past the map, and the row's
+// output is pixel (2y + py, 2x + px) of the map twice as large.
+#ifndef WAVES
+#define WAVES 1
+#endif
+layout(local_size_x = 64 * WAVES) in;
+layout(std430, binding = 0) readonly restrict buffer Src { f16vec4 src4[]; };
+layout(std430, binding = 1) restrict buffer Dst { f16vec2 dst[]; };
+layout(std430, binding = 1) restrict buffer Dst16 { uvec4 dst16[]; };
+layout(std430, binding = 2) readonly restrict buffer Params { f16vec2 params[]; };
+layout(push_constant) uniform PC {
+    int rows; int k; int n; int src_stride; int src_off; int dst_stride; int dst_off;
+    int w_off; int b_off; int relu; int accumulate; int mode; int width; int height;
+    int py; int px;
+} pc;
+
+const int CK = 16;
+shared float16_t tile[CK * 64];
+
+void main() {
+    int id = int(gl_LocalInvocationID.x);
+    int t = id & 63;
+    // Uniform in each wave of 64 lanes or fewer; the broadcast lets the
+    // compiler see it.
+    int wave = subgroupBroadcastFirst(id >> 6);
+    int r0 = int(gl_WorkGroupID.x) * 64;
+    int co0 = (int(gl_WorkGroupID.y) * WAVES + wave) * 64;
+    int np = (pc.n + 63) & ~63;
+    // Each tile (64 rows by 16) is loaded by the first 64 invocations, or
+    // the first 128 with more waves, in blocks of four values of their own
+    // row t: blocks NQ h .. NQ h + NQ - 1, h being id / 64, so that a
+    // wave's lanes write neighbouring rows to the tile.
+    const int NQ = WAVES == 1 ? 4 : 2;
+    bool loads = id < 256 / NQ;
+    int h = id >> 6;
+    int row_y = min(r0 + t, pc.rows - 1) / pc.width;
+    int row_x = min(r0 + t, pc.rows - 1) - row_y * pc.width;
+    int cin = pc.k / ((pc.py + 1) * (pc.px + 1));
+    f16vec2 acc[32];
+    [[unroll]] for (int j = 0; j < 32; j++)
+        acc[j] = f16vec2(0.0);
+    f16vec4 next[NQ];
+    for (int k0 = 0; k0 < pc.k; k0 += CK) {
+        // A chunk of 16 lies within one tap: cin is a multiple of 16.
+        int tap = k0 / cin;
+        int dy = tap / (pc.px + 1);
+        int dx = tap - dy * (pc.px + 1);
+        int y = row_y;
+        int x = row_x;
+        bool inside = loads;
+        int at;
+        if (pc.mode == 1) {
+            y += dy;
+            x += dx;
+            inside = inside && y < pc.height && x < pc.width;
+            at = (min(y, pc.height - 1) * pc.width + min(x, pc.width - 1)) * pc.src_stride
+                + k0 - tap * cin;
+        } else {
+            at = (y * pc.width + x) * pc.src_stride + pc.src_off + k0;
+        }
+        [[unroll]] for (int v = 0; v < NQ; v++)
+            next[v] = inside ? src4[(at >> 2) + NQ * h + v] : f16vec4(0.0);
+        barrier();
+        if (loads)
+            [[unroll]] for (int j = 0; j < 4 * NQ; j++)
+                tile[(4 * NQ * h + j) * 64 + t] = next[j >> 2][j & 3];
+        barrier();
+        if (co0 >= pc.n)
+            continue;
+        [[unroll]] for (int c = 0; c < CK; c++) {
+            int wb = (pc.w_off + (k0 + c) * np + co0) >> 1;
+            f16vec2 v = f16vec2(tile[c * 64 + t]);
+            [[unroll]] for (int j = 0; j < 32; j++)
+                acc[j] = fma(v, params[wb + j], acc[j]);
+        }
+    }
+    int r = r0 + t;
+    if (co0 >= pc.n || r >= pc.rows)
+        return;
+    int at;
+    if (pc.mode == 1) {
+        int y = r / pc.width;
+        int x = r - y * pc.width;
+        at = ((2 * y + pc.py) * 2 * pc.width + 2 * x + pc.px) * pc.dst_stride + co0;
+    } else {
+        at = r * pc.dst_stride + pc.dst_off + co0;
+    }
+    // A lane's row is apart from its neighbours', so where eight columns are
+    // aligned they go out in one 16-byte write instead of four.
+    [[unroll]] for (int q = 0; q < 8; q++) {
+        int col = co0 + 8 * q;
+        if (col >= pc.n)
+            break;
+        bool wide = col + 8 <= pc.n && ((at + 8 * q) & 7) == 0;
+        int i = (at >> 3) + q;
+        uvec4 old = wide && pc.accumulate != 0 ? dst16[i] : uvec4(0);
+        uvec4 w;
+        [[unroll]] for (int h = 0; h < 4; h++) {
+            int j = 4 * q + h;
+            if (!wide && co0 + 2 * j >= pc.n)
+                break;
+            vec2 v = vec2(acc[j]);
+            if (pc.b_off >= 0)
+                v += vec2(params[((pc.b_off + co0) >> 1) + j]);
+            if (pc.accumulate != 0)
+                v += wide ? vec2(unpackFloat2x16(old[h])) : vec2(dst[(at >> 1) + j]);
+            if (pc.relu != 0)
+                v = max(v, vec2(0.0));
+            if (wide)
+                w[h] = packFloat2x16(f16vec2(v));
+            else
+                dst[(at >> 1) + j] = f16vec2(v);
+        }
+        if (wide)
+            dst16[i] = w;
+    }
+}
