@@ -1,0 +1,100 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_GOOGLE_include_directive : require
+// A transformer block's MLP in one pass, for AMD GPUs: each row of K
+// channels (row r at r * stride + off of `map`) gains
+// fc2(gelu(fc1(norm(row)))), its 4K hidden values never leaving registers.
+// A lane takes one row and reads it itself; the weights' index is the same
+// in every lane, so they come through the scalar cache. The hidden values
+// are made HB at a time and each block's share of fc2 added at once, in the
+// order of the hidden index. Every sum runs in gemm.comp's order and rounds
+// where its stored maps do, so the result is that of its two products bit
+// for bit.
+#ifndef K
+#define K 32
+#endif
+const int HIDDEN = 4 * K;
+// Hidden values made at a time: 64 takes 128 VGPRs and, at K 64, 40 KB of
+// code, past GCN's 32 KB instruction cache.
+const int HB = 32;
+// fc2's weights are [HIDDEN][K padded to 64].
+const int NP = (K + 63) & ~63;
+layout(local_size_x = 64) in;
+// Read by the first product and added to by the second, so not restrict.
+layout(std430, binding = 0) buffer Map { f16vec4 map4[]; };
+layout(std430, binding = 0) buffer Map16 { uvec4 map16[]; };
+layout(std430, binding = 1) readonly restrict buffer Params { f16vec2 params[]; };
+layout(std430, binding = 1) readonly restrict buffer Scalars { float16_t ps[]; };
+layout(push_constant) uniform PC {
+    int stride; int off; int w1_off; int b1_off; int w2_off; int b2_off; int g_off; int beta_off;
+} pc;
+
+#include "gelu.glsl"
+
+void main() {
+    int start = int(gl_GlobalInvocationID.x) * pc.stride + pc.off;
+    float sum = 0.0;
+    float squares = 0.0;
+    [[unroll]] for (int q = 0; q < K / 4; q++) {
+        f16vec4 v = map4[(start >> 2) + q];
+        [[unroll]] for (int e = 0; e < 4; e++) {
+            sum += float(v[e]);
+            squares = fma(float(v[e]), float(v[e]), squares);
+        }
+    }
+    float mean = sum / float(K);
+    float scale = inversesqrt(max(squares / float(K) - mean * mean, 0.0) + 1e-5);
+
+    f16vec2 out2[K / 2];
+    [[unroll]] for (int j = 0; j < K / 2; j++)
+        out2[j] = f16vec2(0.0);
+    [[dont_unroll]] for (int h0 = 0; h0 < HIDDEN; h0 += HB) {
+        f16vec2 acc[HB / 2];
+        [[unroll]] for (int j = 0; j < HB / 2; j++)
+            acc[j] = f16vec2(0.0);
+        [[dont_unroll]] for (int c0 = 0; c0 < K; c0 += 16) {
+            float16_t x[16];
+            [[unroll]] for (int q = 0; q < 4; q++) {
+                f16vec4 v = map4[((start + c0) >> 2) + q];
+                [[unroll]] for (int e = 0; e < 4; e++) {
+                    int c = c0 + 4 * q + e;
+                    x[4 * q + e] = float16_t((float(v[e]) - mean) * scale * float(ps[pc.g_off + c])
+                        + float(ps[pc.beta_off + c]));
+                }
+            }
+            [[unroll]] for (int c = 0; c < 16; c++) {
+                int wb = (pc.w1_off + (c0 + c) * HIDDEN + h0) >> 1;
+                f16vec2 v = f16vec2(x[c]);
+                [[unroll]] for (int j = 0; j < HB / 2; j++)
+                    acc[j] = fma(v, params[wb + j], acc[j]);
+            }
+        }
+        [[unroll]] for (int j = 0; j < HB / 2; j++) {
+            vec2 v = vec2(acc[j]);
+            if (pc.b1_off >= 0)
+                v += vec2(params[((pc.b1_off + h0) >> 1) + j]);
+            acc[j] = f16vec2(gelu(v.x), gelu(v.y));
+        }
+        [[unroll]] for (int c = 0; c < HB; c++) {
+            int wb = (pc.w2_off + (h0 + c) * NP) >> 1;
+            f16vec2 v = f16vec2((c & 1) == 0 ? acc[c >> 1].x : acc[c >> 1].y);
+            [[unroll]] for (int j = 0; j < K / 2; j++)
+                out2[j] = fma(v, params[wb + j], out2[j]);
+        }
+    }
+    [[unroll]] for (int q = 0; q < K / 8; q++) {
+        uvec4 old = map16[(start >> 3) + q];
+        uvec4 w;
+        [[unroll]] for (int e = 0; e < 4; e++) {
+            int j = 4 * q + e;
+            vec2 v = vec2(out2[j]);
+            if (pc.b2_off >= 0)
+                v += vec2(params[(pc.b2_off >> 1) + j]);
+            v += vec2(unpackFloat2x16(old[e]));
+            w[e] = packFloat2x16(f16vec2(v));
+        }
+        map16[(start >> 3) + q] = w;
+    }
+}

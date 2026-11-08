@@ -1,0 +1,123 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : require
+#extension GL_EXT_shader_16bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : require
+#extension GL_KHR_shader_subgroup_shuffle : require
+// Attention of one head over one 8 x 8 window: a workgroup per (window,
+// head), two invocations per query token, each with half of the head's
+// channels: the pair adds its two halves of each score, and each keeps its
+// half of the output, so a lane holds half the registers. Keys and values of
+// the window go to shared memory. Products run in packed half floats, summed
+// in floats eight channels (or eight keys) at a time; scores and a running
+// softmax over blocks of eight keys are in floats.
+// `qkv` rows hold 3c values (queries, keys, values); the output row's 32
+// channels of this head are written. The bias of window `base / 64 + w` is
+// the table of its class: whether it is last in its row of windows (1) or
+// column (2) when the map was rolled, which carries the masks.
+layout(local_size_x = 128) in;
+layout(std430, binding = 0) readonly restrict buffer Qkv { f16vec4 qkv[]; };
+layout(std430, binding = 1) writeonly restrict buffer Dst { uvec4 dst[]; };
+layout(std430, binding = 2) readonly restrict buffer Params { float16_t ps[]; };
+layout(push_constant) uniform PC {
+    int c; int bias_off; int shifted; int width; int height; int base;
+} pc;
+
+const int N = 64;
+const int D = 32;
+// Pairs of channels each invocation of a pair holds.
+const int H = D / 4;
+shared f16vec2 keys[N * D / 2];
+shared f16vec2 values[N * D / 2];
+
+void main() {
+    int id = int(gl_LocalInvocationID.x);
+    int i = id >> 1;
+    // Which half of the channels.
+    int u = id & 1;
+    int w = int(gl_WorkGroupID.x);
+    int h = int(gl_WorkGroupID.y);
+    int heads = pc.c / D;
+    // The token's half row, in blocks of four values.
+    int row = ((w * N + i) * 3 * pc.c + h * D + u * D / 2) >> 2;
+    int third = pc.c >> 2;
+    int own = i * D / 2 + u * H;
+    [[unroll]] for (int d = 0; d < H / 2; d++) {
+        f16vec4 k = qkv[row + third + d];
+        f16vec4 v = qkv[row + 2 * third + d];
+        keys[own + 2 * d] = k.xy;
+        keys[own + 2 * d + 1] = k.zw;
+        values[own + 2 * d] = v.xy;
+        values[own + 2 * d + 1] = v.zw;
+    }
+    // Queries are scaled by 1/sqrt(32) before the products, as on the CPU.
+    f16vec2 q[H];
+    [[unroll]] for (int d = 0; d < H / 2; d++) {
+        f16vec4 x = qkv[row + d] * float16_t(0.17677669);
+        q[2 * d] = x.xy;
+        q[2 * d + 1] = x.zw;
+    }
+    barrier();
+    int kind = 0;
+    if (pc.shifted != 0) {
+        int columns = pc.width >> 3;
+        int g = (pc.base >> 6) + w;
+        kind = int(g % columns == columns - 1) + 2 * int(g / columns == (pc.height >> 3) - 1);
+    }
+    int bias = pc.bias_off + ((kind * heads + h) * N + i) * N;
+    // A running softmax over blocks of eight keys: each block's weights are
+    // taken against the largest score so far, and the sums so far scaled
+    // down when a block raises it.
+    // Below every score; an infinity would leave the first rescale to the
+    // compiler's handling of infinities.
+    float top = -1e30;
+    float total = 0.0;
+    vec2 out_[H];
+    [[unroll]] for (int d = 0; d < H; d++)
+        out_[d] = vec2(0.0);
+    // Not unrolled: eight copies of the body make 38 KB of code, past the
+    // 32 KB instruction cache AMD's GCN shares between compute units.
+    for (int j0 = 0; j0 < N; j0 += 8) {
+        float s[8];
+        float block_top = top;
+        [[unroll]] for (int j = 0; j < 8; j++) {
+            float a = 0.0;
+            [[unroll]] for (int d = 0; d < H; d += 4) {
+                int at = (j0 + j) * D / 2 + u * H + d;
+                f16vec2 p = q[d] * keys[at];
+                p = fma(q[d + 1], keys[at + 1], p);
+                p = fma(q[d + 2], keys[at + 2], p);
+                p = fma(q[d + 3], keys[at + 3], p);
+                vec2 f = vec2(p);
+                a += f.x + f.y;
+            }
+            s[j] = a + subgroupShuffleXor(a, 1) + float(ps[bias + j0 + j]);
+            block_top = max(block_top, s[j]);
+        }
+        float rescale = exp(top - block_top);
+        top = block_top;
+        total *= rescale;
+        [[unroll]] for (int d = 0; d < H; d++)
+            out_[d] *= rescale;
+        f16vec2 part[H];
+        [[unroll]] for (int d = 0; d < H; d++)
+            part[d] = f16vec2(0.0);
+        [[unroll]] for (int j = 0; j < 8; j++) {
+            float e = exp(s[j] - top);
+            total += e;
+            f16vec2 p = f16vec2(float16_t(e));
+            [[unroll]] for (int d = 0; d < H; d++)
+                part[d] = fma(p, values[(j0 + j) * D / 2 + u * H + d], part[d]);
+        }
+        [[unroll]] for (int d = 0; d < H; d++)
+            out_[d] += vec2(part[d]);
+    }
+    // Neighbouring tokens write rows apart, so eight channels go out per
+    // 16-byte write; c is a multiple of 32.
+    int o = ((w * N + i) * pc.c + h * D + u * D / 2) >> 3;
+    [[unroll]] for (int b = 0; b < D / 16; b++) {
+        uvec4 v;
+        [[unroll]] for (int e = 0; e < 4; e++)
+            v[e] = packFloat2x16(f16vec2(out_[4 * b + e] / total));
+        dst[o + b] = v;
+    }
+}
