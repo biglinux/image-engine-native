@@ -21,6 +21,7 @@ rounding.
 import argparse
 import pathlib
 import sys
+import unicodedata
 import zlib
 
 import numpy as np
@@ -59,8 +60,10 @@ def prepare(args):
         except OSError:
             print(f"skipped {path.name}: not an image", file=sys.stderr)
             continue
-        # Names that differ in case only collide on some file systems.
-        other = photos.setdefault(path.stem.casefold(), path)
+        # Names that differ in case or Unicode normalization only collide
+        # on some file systems.
+        key = unicodedata.normalize("NFC", path.stem).casefold()
+        other = photos.setdefault(key, path)
         if other != path:
             sys.exit(f"{path.name} and {other.name} would write the same files")
     if not photos:
