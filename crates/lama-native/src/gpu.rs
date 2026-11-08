@@ -480,8 +480,10 @@ pub struct Network {
 }
 
 impl Network {
-    /// Open a GPU and load the weights in `path` onto it.
+    /// Open a GPU and load the weights in `path` onto it. The GPU comes
+    /// first: without one, the weights are read only for the CPU.
     pub fn load(path: &Path) -> Result<Self, Error> {
+        let mut gpu = Gpu::open().map_err(Error::Gpu)?;
         let mut file = WeightFile::read(path, b"LAMA\0\0\0\0")?;
         let mut params = Params::default();
         let p = &mut params;
@@ -526,7 +528,6 @@ impl Network {
         let last = Linear::load_rows(&mut file, p, "last", (49 * 64, 3), 4, true)?;
         file.finish()?;
 
-        let mut gpu = Gpu::open().map_err(Error::Gpu)?;
         let kernel = |spirv, bindings, push| gpu.kernel(spirv, bindings, push).map_err(Error::Gpu);
         let shared = gpu.vendor() != AMD && gpu.max_shared_memory() >= SHARED_BYTES;
         let (conv7, conv7_columns) = match (shared, gpu.vendor()) {

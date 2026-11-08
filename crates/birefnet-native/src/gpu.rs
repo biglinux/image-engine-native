@@ -423,10 +423,11 @@ pub struct Network {
 }
 
 impl Network {
-    /// Open a GPU and load the weights in `path` onto it.
+    /// Open a GPU and load the weights in `path` onto it. The GPU comes
+    /// first: without one, the weights are read only for the CPU.
     pub fn load(path: &Path) -> Result<Self, Error> {
-        let (layers, params) = Layers::load(path)?;
         let mut gpu = Gpu::open().map_err(Error::Gpu)?;
+        let (layers, params) = Layers::load(path)?;
         let kernel = |spirv, bindings, push| gpu.kernel(spirv, bindings, push).map_err(Error::Gpu);
         let gemm = if gpu.vendor() != AMD && gpu.max_shared_memory() >= SHARED_BYTES {
             Products::Shared(kernel(spirv!("gemm_shared"), 4, GEMM_PUSH)?)

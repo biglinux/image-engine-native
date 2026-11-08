@@ -81,12 +81,13 @@ pub struct Network {
 }
 
 impl Network {
-    /// Open a GPU and load the weights in `path` onto it.
+    /// Open a GPU and load the weights in `path` onto it. The GPU comes
+    /// first: without one, the weights are read only for the CPU.
     pub fn load(path: &Path) -> Result<Self, Error> {
+        let mut gpu = Gpu::open().map_err(Error::Gpu)?;
         let mut file = WeightFile::read(path, b"REALESRG")?;
         let (words, layers) = params(&mut file)?;
         file.finish()?;
-        let mut gpu = Gpu::open().map_err(Error::Gpu)?;
         let shared = gpu.vendor() != AMD && gpu.max_shared_memory() >= SHARED_BYTES;
         // Intel's compiler spills the sums of eight pixels out of registers.
         let (spirv, block) = if shared && gpu.vendor() == INTEL {
