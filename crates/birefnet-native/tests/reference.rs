@@ -30,9 +30,8 @@ fn matches_pytorch_reference() {
             continue;
         }
         let reference = path.with_extension("torch.logits");
-        let Ok(bytes) = std::fs::read(&reference) else {
-            continue;
-        };
+        let bytes = std::fs::read(&reference)
+            .unwrap_or_else(|e| panic!("{}: {e}", reference.display()));
         let want: Vec<f32> = bytes
             .as_chunks::<4>()
             .0
@@ -76,7 +75,7 @@ fn matches_pytorch_reference() {
     }
     assert!(
         checked > 0,
-        "no NAME.rgb with NAME.torch.logits in {}",
+        "no NAME.rgb in {}",
         dir.display()
     );
 }

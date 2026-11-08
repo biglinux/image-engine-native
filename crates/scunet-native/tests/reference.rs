@@ -37,9 +37,9 @@ fn matches_pytorch_reference() {
         if path.extension().is_none_or(|e| e != "rgb") {
             continue;
         }
-        let Ok(bytes) = std::fs::read(path.with_extension("torch.out")) else {
-            continue;
-        };
+        let reference = path.with_extension("torch.out");
+        let bytes = std::fs::read(&reference)
+            .unwrap_or_else(|e| panic!("{}: {e}", reference.display()));
         let want: Vec<f32> = bytes
             .as_chunks::<4>()
             .0
@@ -80,7 +80,7 @@ fn matches_pytorch_reference() {
     }
     assert!(
         checked > 0,
-        "no NAME.rgb with NAME.torch.out in {}",
+        "no NAME.rgb in {}",
         dir.display()
     );
 }
