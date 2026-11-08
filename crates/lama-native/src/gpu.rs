@@ -965,6 +965,10 @@ mod tests {
                         .collect()
                 });
             }
+            assert!(
+                outs.iter().flatten().all(|v| v.is_finite()),
+                "pass {pass}: values not finite"
+            );
             let scale = outs[0].iter().fold(0.0f32, |m, v| m.max(v.abs()));
             // Floats for passes 0 and 2, half floats for 1 and 3.
             let tolerance = if pass % 2 == 0 { 1e-5 } else { 2e-3 };

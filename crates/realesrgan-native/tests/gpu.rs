@@ -45,6 +45,7 @@ fn gpu_matches_cpu_engine() {
             .collect();
         let got = gpu.run_float(&image, width, height).unwrap();
         let want = cpu.run_float(&image, width, height).unwrap();
+        assert_eq!(got.len(), want.len(), "{}: output size", path.display());
         // Half floats move a share of 8-bit values by a step or a few: 52 to
         // 57 dB on the 20 test photos, with the same PSNR against the
         // originals to within 0.02 dB.
@@ -61,6 +62,7 @@ fn gpu_matches_cpu_engine() {
                 ControlFlow::Continue(())
             })
             .unwrap();
+        assert_eq!(tiled.len(), got.len(), "{}: tiled size", path.display());
         assert!(
             tiled
                 .iter()

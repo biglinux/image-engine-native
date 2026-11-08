@@ -57,6 +57,7 @@ fn gpu_matches_cpu_engine() {
         let holes: Vec<f32> = mask.iter().map(|&m| f32::from(u8::from(m != 0))).collect();
         let got = gpu.run_float(&image, &holes, width, height).unwrap();
         let want = cpu.run_float(&image, &holes, width, height).unwrap();
+        assert_eq!(got.len(), want.len(), "{}: output size", path.display());
         // LaMa invents what fills the holes, and small differences grow into
         // other plausible fills: compare each with the photo itself. On the
         // 20 test photos half floats move a photo's PSNR by 0.15 dB at most
