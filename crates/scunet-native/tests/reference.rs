@@ -53,6 +53,11 @@ fn matches_pytorch_reference() {
             .collect();
         let got = model.run_float(&image, width, height).unwrap();
         assert_eq!(got.len(), want.len(), "{}: output size", path.display());
+        assert!(
+            got.iter().chain(&want).all(|v| v.is_finite()),
+            "{}: values not finite",
+            path.display()
+        );
         // A float32 run of the same network: within 1e-5 (rounding differences
         // reach 2e-6), and no 8-bit value more than one step away.
         let worst = got

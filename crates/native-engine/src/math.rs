@@ -154,6 +154,13 @@ dispatch! {
 dispatch! {
     /// Layer normalisation of each `gamma.len()`-long row of `x`, epsilon 1e-5.
     pub layer_norm(x: &mut [f32], gamma: &[f32], beta: &[f32]) {
+        assert!(
+            x.len().is_multiple_of(gamma.len()) && beta.len() == gamma.len(),
+            "rows of {} values with {} betas cannot hold {}",
+            gamma.len(),
+            beta.len(),
+            x.len()
+        );
         for row in x.chunks_exact_mut(gamma.len()) {
             layer_norm_body(row, gamma, beta);
         }
