@@ -562,6 +562,11 @@ impl Commands<'_> {
                 src.size, dst.size
             ));
         }
+        // Vulkan forbids empty and overlapping regions; both copies change
+        // nothing.
+        if bytes == 0 || src.buffer == dst.buffer {
+            return Ok(());
+        }
         let region = ffi::BufferCopy {
             src_offset: 0,
             dst_offset: 0,
