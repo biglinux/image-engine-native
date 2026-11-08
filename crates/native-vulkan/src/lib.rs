@@ -400,7 +400,15 @@ impl Gpu {
         let waited = check("waiting for the GPU", unsafe {
             (d.wait_for_fences)(h, 1, &self.fence[slot], 1, u64::MAX)
         });
-        // SAFETY: the submission has finished, or the device is lost.
+        if waited.is_err() {
+            // SAFETY: the device is valid. A failed fence wait may leave the
+            // submission running, and nothing below may reset its objects
+            // until the device is idle.
+            if check("waiting for the GPU", unsafe { (d.device_wait_idle)(h) }).is_err() {
+                return waited;
+            }
+        }
+        // SAFETY: the submission has finished.
         let reset = check("resetting a fence", unsafe {
             (d.reset_fences)(h, 1, &self.fence[slot])
         });
