@@ -42,6 +42,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             _ => images.push(PathBuf::from(arg)),
         }
     }
+    if images.is_empty() {
+        return Err(usage.into());
+    }
     let start = Instant::now();
     let mut model = Model::load(&weights, threads)?;
     let device = match model.gpu() {
