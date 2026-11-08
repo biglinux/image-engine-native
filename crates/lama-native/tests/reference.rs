@@ -7,7 +7,7 @@
 //!
 //!     LAMA_NATIVE_WEIGHTS=weights/big-lama.weights \
 //!     LAMA_NATIVE_REFERENCE=corpus LAMA_NATIVE_SIZE=512x512 \
-//!     cargo test --release -- --ignored
+//!     cargo test --release --test reference -- --ignored
 
 use std::ops::ControlFlow;
 use std::path::PathBuf;

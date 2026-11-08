@@ -6,7 +6,7 @@
 //!
 //!     SCUNET_NATIVE_WEIGHTS=weights/scunet-color-real-psnr.weights \
 //!     SCUNET_NATIVE_REFERENCE=corpus SCUNET_NATIVE_SIZE=768x512 \
-//!     cargo test --release -- --ignored
+//!     cargo test --release --test reference -- --ignored
 
 use std::ops::ControlFlow;
 use std::path::PathBuf;

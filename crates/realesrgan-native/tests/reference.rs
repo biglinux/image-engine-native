@@ -6,7 +6,7 @@
 //!
 //!     REALESRGAN_NATIVE_WEIGHTS=weights/realesr-general-x4v3-dn50.weights \
 //!     REALESRGAN_NATIVE_REFERENCE=corpus REALESRGAN_NATIVE_SIZE=384x256 \
-//!     cargo test --release -- --ignored
+//!     cargo test --release --test reference -- --ignored
 
 use std::ops::ControlFlow;
 use std::path::PathBuf;
